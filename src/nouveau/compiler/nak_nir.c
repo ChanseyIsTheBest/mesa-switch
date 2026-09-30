@@ -203,8 +203,19 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
       LOOP_OPT(nir, nir_opt_dce);
       LOOP_OPT(nir, nir_opt_cse);
 
+      /* NFSMW: NAK is the Mesa driver that flattens branches the least. With limit = 0 it only
+       * flattens ifs with both sides empty; ANV uses 8 and so does RADV. And NAK has no
+       * if-to-predicate pass, so every if that survives NIR becomes a real branch
+       * (SSY/BRA/SYNC) on Maxwell.
+       *
+       * In this game that matters a lot: the frame is pure shading, ~300 operations per
+       * fragment, and the scene runs at 31 % of the GPU's arithmetic peak. The shader translator
+       * already went from 1806 to 334 branches; the remaining ones have to be flattened by the driver.
+       *
+       * Watch with NVK_SHADER_STATS=1: flattening raises register pressure, and on GM20B a spill
+       * to local memory is very expensive. If "B de memoria local" goes above 0, go back to 0. */
       nir_opt_peephole_select_options peephole_select_options = {
-         .limit = 0,
+         .limit = 8,
          .discard_ok = true,
       };
       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,

@@ -1145,6 +1145,53 @@ struct vk_graphics_pipeline {
    struct vk_pipeline_stage stages[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
 };
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: PRECARGA (ver vk_pipeline.h). */
+int32_t vk_switch_precarga = 0;
+
+static inline void
+vk_switch_precargar_bytes(const void *p, size_t bytes)
+{
+   const char *c = p;
+   if (bytes == 0)
+      return;
+   for (size_t i = 0; i < bytes; i += 64)
+      __builtin_prefetch(c + i, 0, 3);
+   __builtin_prefetch(c + bytes - 1, 0, 3);
+}
+
+/* What vk_graphics_pipeline_cmd_bind and vk_dynamic_graphics_state_copy read
+ * from the pipeline: the whole fixed state, from its vertex input the binding mask
+ * with the first bindings and the attribute mask with the first 8, and
+ * the first two stages.
+ */
+static void
+vk_switch_precargar_gfx(const struct vk_graphics_pipeline *gfx)
+{
+   const struct vk_vertex_input_state *vi = &gfx->linked._dynamic_vi;
+   vk_switch_precargar_bytes(&gfx->linked.dynamic, sizeof(gfx->linked.dynamic));
+   vk_switch_precargar_bytes(vi, 64);
+   vk_switch_precargar_bytes(&vi->attributes_valid,
+                             (const char *)&vi->attributes[8] -
+                             (const char *)&vi->attributes_valid);
+   vk_switch_precargar_bytes(&gfx->stage_count,
+                             (const char *)&gfx->stages[2] -
+                             (const char *)&gfx->stage_count);
+}
+
+void
+vk_switch_precargar_pipeline(VkPipeline _pipeline)
+{
+   VK_FROM_HANDLE(vk_pipeline, pipeline, _pipeline);
+   if (pipeline == NULL ||
+       pipeline->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS ||
+       (pipeline->flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))
+      return;
+   vk_switch_precargar_gfx(
+      container_of(pipeline, struct vk_graphics_pipeline, base));
+}
+#endif
+
 static void
 vk_graphics_pipeline_destroy(struct vk_device *device,
                              struct vk_pipeline *pipeline,
@@ -1212,6 +1259,11 @@ vk_graphics_pipeline_cmd_bind(struct vk_command_buffer *cmd_buffer,
       assert(pipeline->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS);
       assert(!(pipeline->flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR));
       gfx_pipeline = container_of(pipeline, struct vk_graphics_pipeline, base);
+#ifdef HAVE_SWITCH_PLATFORM
+      /* NFSMW: the cache lines of the copy below, requested all at once */
+      if (vk_switch_precarga > 0)
+         vk_switch_precargar_gfx(gfx_pipeline);
+#endif
 
       for (uint32_t i = 0; i < gfx_pipeline->stage_count; i++) {
          struct vk_shader *shader = gfx_pipeline->stages[i].shader;

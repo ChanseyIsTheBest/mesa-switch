@@ -12,6 +12,8 @@
 
 #include "vk_format.h"
 
+#include "util/u_debug.h"
+
 #include "nv_push_cl9097.h"
 #include "nv_push_cl90c0.h"
 #include "nv_push_clb197.h"
@@ -417,6 +419,28 @@ nvk_cmd_copy_image_to_buffer_meta(struct nvk_cmd_buffer *cmd,
    nvk_meta_end_compute(cmd, &save);
 }
 
+/* On a unified-memory SoC copies should be cheaper on the copy engine
+ * (DMA) than with vk_meta shaders, because those occupy the same SMs that are shading pixels.
+ * Ported from NXVK (src/nouveau/vulkan/nvk_cmd_meta.c, nvk_copy_prefers_copy_engine).
+ *
+ * Measured on the console and turned off. It came out backwards: the copies category of the C2
+ * report went from 2.67 to 3.79 ms per frame, i.e. +1.12 ms, for nothing in return. It was also
+ * suspected of making the car body darken at times, since the rear-view mirror cubemap uses copies.
+ * The function and its four uses stay in place so it can be measured again without touching code:
+ * NVK_COPY_ENGINE=1 (through nfsmw_mesa_entorno) turns it on.
+ */
+static bool
+nvk_copy_prefers_copy_engine(struct nvk_cmd_buffer *cmd)
+{
+   const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
+   if (pdev->info.type != NV_DEVICE_TYPE_SOC)
+      return false;
+
+   return debug_get_bool_option("NVK_COPY_ENGINE", false);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                           const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
@@ -425,7 +449,8 @@ nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_image, src, pCopyImageToBufferInfo->srcImage);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
+   if (!nvk_copy_prefers_copy_engine(cmd) &&
+       (queue_flags & VK_QUEUE_COMPUTE_BIT) &&
        nvk_meta_image_copy_compute_supported(src)) {
       nvk_cmd_copy_image_to_buffer_meta(cmd, pCopyImageToBufferInfo);
    } else {
@@ -459,7 +484,8 @@ nvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_image, dst, pCopyBufferToImageInfo->dstImage);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
+   if (!nvk_copy_prefers_copy_engine(cmd) &&
+       (queue_flags & VK_QUEUE_COMPUTE_BIT) &&
        nvk_meta_image_copy_compute_supported(dst)) {
       nvk_cmd_copy_buffer_to_image_meta(cmd, pCopyBufferToImageInfo,
                               VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -499,7 +525,9 @@ nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_image, dst, pCopyImageInfo->dstImage);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if ((queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
+   if (nvk_copy_prefers_copy_engine(cmd)) {
+      nvk_cmd_copy_image_ce(cmd, pCopyImageInfo);
+   } else if ((queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
        nvk_meta_image_copy_gfx_supported(src) &&
        nvk_meta_image_copy_gfx_supported(dst)) {
       nvk_cmd_copy_image_meta(cmd, pCopyImageInfo,
@@ -533,7 +561,8 @@ nvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
+   if (!nvk_copy_prefers_copy_engine(cmd) &&
+       (queue_flags & VK_QUEUE_COMPUTE_BIT)) {
       nvk_cmd_copy_buffer_meta(cmd, pCopyBufferInfo);
    } else {
       nvk_cmd_copy_buffer_ce(cmd, pCopyBufferInfo);

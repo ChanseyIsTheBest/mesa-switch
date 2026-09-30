@@ -31,6 +31,10 @@ struct nvkmd_switch_ctx {
    struct nvkmd_ctx base;
    enum nvkmd_engines engines;
    struct nouveau_horizon_channel *channel;
+   /* ZCULL context switch buffer, one per channel. NULL if the channel has no 3D or if
+    * the kernel did not publish ZCULL geometry.
+    */
+   struct nvkmd_mem *zcull_mem;
    struct nouveau_horizon_fence last_fence;
    bool has_last_fence;
    bool teardown_quarantined;
@@ -259,6 +263,15 @@ nvkmd_switch_ctx_try_destroy(struct nvkmd_ctx *_ctx,
                        reason);
       }
       return false;
+   }
+
+   /* Only after channel_put() has reported COMPLETE, i.e. when the GPU can no longer
+    * reach this buffer. On the quarantine path above it is deliberately kept, as
+    * the Gallium teardown does (nouveau_switch_pushbuf.c:1985-1999 versus :2026).
+    */
+   if (ctx->zcull_mem != NULL) {
+      nvkmd_mem_unref(ctx->zcull_mem);
+      ctx->zcull_mem = NULL;
    }
 
    FREE(ctx);
@@ -1167,6 +1180,50 @@ nvkmd_switch_dev_create_ctx(struct nvkmd_dev *_dev,
          return nvkmd_switch_status_result(log_obj, status,
                                             VK_ERROR_INITIALIZATION_FAILED,
                                             "create channel");
+      }
+
+      /* Hierarchical depth culling needs this.
+       *
+       * ZCULL keeps its RAM in a per-channel buffer that must be bound before the first submit.
+       * Without it, the 3D engine receives SET_ZCULL_* commands with nowhere to store anything. The three
+       * reference implementations do the same in the same order: legacy libdrm-nouveau
+       * (pushbuf.c:475,489,518), our Gallium path (nouveau_switch_pushbuf.c:1815,1882,2026) and
+       * NXVK (nvkmd/nvgpu/nvkmd_nvgpu_ctx.c:326-338).
+       *
+       * The buffer arrives zeroed: nouveau_horizon_memory_create() does a memset and cleans the CPU
+       * cache on every allocation, new or recycled (nouveau_horizon_memory.c:612-625). This is mandatory:
+       * LOAD_ZCULL on garbage data kills the GPU context (nvk_cmd_buffer.c:1182-1186).
+       *
+       * The 0x20000 alignment comes from the upstream reference; it is not a number chosen here.
+       */
+      const uint32_t zcull_ctx_size_B =
+         ((engines & NVKMD_ENGINE_3D) && _dev->pdev->dev_info.has_zcull_info)
+            ? nvGpuGetZcullCtxSize()
+            : 0;
+
+      if (zcull_ctx_size_B > 0) {
+         VkResult result = nvkmd_dev_alloc_mem(_dev, log_obj, zcull_ctx_size_B,
+                                               0x20000, NVKMD_MEM_LOCAL,
+                                               &ctx->zcull_mem);
+         if (result != VK_SUCCESS) {
+            (void)nvkmd_switch_ctx_try_destroy(&ctx->base, log_obj);
+            return result;
+         }
+
+         const enum nouveau_horizon_status zcull_status =
+            nouveau_horizon_channel_bind_zcull(ctx->channel,
+                                               ctx->zcull_mem->va->addr);
+         if (zcull_status != NOUVEAU_HORIZON_SUCCESS) {
+            (void)nvkmd_switch_ctx_try_destroy(&ctx->base, log_obj);
+            return nvkmd_switch_status_result(log_obj, zcull_status,
+                                               VK_ERROR_INITIALIZATION_FAILED,
+                                               "bind the ZCULL context");
+         }
+
+         vk_logi(VK_LOG_OBJS(log_obj),
+                 "nvkmd-switch: contexto de ZCULL atado (%u B @ 0x%llx)",
+                 zcull_ctx_size_B,
+                 (unsigned long long)ctx->zcull_mem->va->addr);
       }
    }
 

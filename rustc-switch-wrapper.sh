@@ -65,6 +65,8 @@ done
 # (e.g. the devkitpro-mesa-rust container) it does not exist and rustc would
 # fail with "linker not found".
 FALLBACK_LINKER=C:/msys64/ucrt64/bin/gcc.exe
+# The MSYS2 installed here is MINGW64, not UCRT64.
+[ -x "$FALLBACK_LINKER" ] || FALLBACK_LINKER=C:/msys64/mingw64/bin/gcc.exe
 if [ ! -x "$FALLBACK_LINKER" ]; then
     FALLBACK_LINKER="$(command -v cc || command -v gcc || true)"
 fi

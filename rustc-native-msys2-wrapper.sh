@@ -44,4 +44,12 @@ for arg in "$@"; do
     esac
 done
 
-exec "$RUSTC_BIN" -C linker=C:/msys64/ucrt64/bin/gcc.exe "${ARGS[@]}"
+# The original machine had the UCRT64 environment; this MSYS2 is MINGW64. Whichever exists is used.
+NATIVE_LINKER="${MESA_SWITCH_NATIVE_LINKER:-}"
+if [ -z "$NATIVE_LINKER" ]; then
+    for cand in C:/msys64/ucrt64/bin/gcc.exe C:/msys64/mingw64/bin/gcc.exe C:/msys64/clang64/bin/gcc.exe; do
+        [ -x "$cand" ] && NATIVE_LINKER="$cand" && break
+    done
+fi
+[ -n "$NATIVE_LINKER" ] || NATIVE_LINKER="$(command -v gcc || command -v cc)"
+exec "$RUSTC_BIN" -C linker="$NATIVE_LINKER" "${ARGS[@]}"

@@ -486,9 +486,12 @@ impl SM50Op for OpFAdd {
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F32);
 
         if src1.as_imm_not_f20().is_some()
-            && self.rnd_mode != FRndMode::NearestEven
+            && (self.rnd_mode != FRndMode::NearestEven || self.saturate)
         {
-            // Hardware cannot encode long-immediate + rounding mode
+            // Hardware cannot encode long-immediate + rounding mode.
+            // NFSMW: nor saturate. FADD32I has no SAT bit on SM50, so the
+            // .SAT of fsat(fadd(a, imm32)) was silently dropped (the sea of the
+            // coastal tracks came out black: saturate(x - 0.4) went negative).
             b.copy_alu_src(src1, GPR, SrcType::F32);
         }
     }

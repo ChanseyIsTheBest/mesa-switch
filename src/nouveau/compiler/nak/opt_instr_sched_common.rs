@@ -284,12 +284,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         Op::Redux(_) | Op::R2UR(_) => 15,
 
         // Texture ops
+        //
+        // 32 falls far short on a SoC with shared memory (GM20B + LPDDR4): a texture miss costs
+        // hundreds of cycles. Raising it makes the pre-pass separate the sample from its consumer
+        // and keep more requests in flight. It only affects the scheduler's priority;
+        // the scoreboard barriers are computed separately in calc_instr_deps.rs.
         Op::Tex(_)
         | Op::Tld(_)
         | Op::Tld4(_)
         | Op::Tmml(_)
         | Op::Txd(_)
-        | Op::Txq(_) => 32,
+        | Op::Txq(_) => 200,
 
         // Surface ops
         Op::SuLd(_)
@@ -314,7 +319,10 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         | Op::Ipa(_)
         | Op::CCtl(_)
         | Op::LdTram(_)
-        | Op::MemBar(_) => 32,
+        // Like textures, a global memory load from shared LPDDR4 does not take
+        // 32 cycles. Ipa and ALd are cheaper, but they share the same match arm and the only effect
+        // of overestimating them is placing them earlier.
+        | Op::MemBar(_) => 200,
 
         // Control-flow ops
         Op::WarpSync(_) => 16,

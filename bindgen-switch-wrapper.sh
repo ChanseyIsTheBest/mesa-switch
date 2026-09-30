@@ -36,6 +36,12 @@ else
 fi
 CLANG_RES_DIR="$("$CLANG_BIN" -print-resource-dir)/include"
 
+# __sFILE (devkitA64's FILE) fails the size check that bindgen generates
+# (it computes 184 and emits 176). Mesa only uses it through a pointer, so it is declared opaque.
+# The only structures whose size does not match are the Linux DRM ones (drm_agp_*, drm_map,
+# drm_wait_vblank...), which do not exist and are not used on Switch; all the others pass the check.
+set -- "--no-layout-tests" "--opaque-type" "__sFILE" "$@"
+
 # Append a sentinel, then rotate args from front to back, injecting after "--".
 inject_done=0
 set -- "$@" "__BINDGEN_WRAPPER_END__"

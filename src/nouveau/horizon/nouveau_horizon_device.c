@@ -61,19 +61,31 @@ nouveau_horizon_get_gm20b_info(struct nv_device_info *info_out)
    info_out->nc_atom_size_B = 128;
 }
 
-static void
-nouveau_horizon_add_runtime_device_info(struct nouveau_horizon_device *device)
+void
+nouveau_horizon_add_zcull_info(struct nv_device_info *info_out)
 {
+   if (info_out == NULL)
+      return;
+
    const nvioctl_zcull_info *zcull = nvGpuGetZcullInfo();
    const uint32_t ctxsw_size = nvGpuGetZcullCtxSize();
    if (zcull == NULL || ctxsw_size == 0 ||
        zcull->width_align_pixels == 0 ||
        zcull->height_align_pixels == 0 ||
        zcull->pixel_squares_by_aliquots == 0 ||
-       zcull->aliquot_total == 0)
+       zcull->aliquot_total == 0 ||
+       /* nil divides by these alignments and indexes a fixed array of 16 entries
+        * (src/nouveau/nil/zcull.rs). Odd data from the kernel would cause a division by zero or a
+        * Rust panic inside vkCreateImage. Here they are rejected and ZCULL stays off, which is
+        * the correct failure. NXVK validates the same (nvkmd_nvgpu_pdev.c:77-85).
+        */
+       zcull->subregion_width_align_pixels == 0 ||
+       zcull->subregion_height_align_pixels == 0 ||
+       zcull->subregion_count == 0 ||
+       zcull->subregion_count > 16)
       return;
 
-   device->info.zcull_info = (struct nv_zcull_device_info) {
+   info_out->zcull_info = (struct nv_zcull_device_info) {
       .width_align_pixels = zcull->width_align_pixels,
       .height_align_pixels = zcull->height_align_pixels,
       .pixel_squares_by_aliquots = zcull->pixel_squares_by_aliquots,
@@ -90,7 +102,7 @@ nouveau_horizon_add_runtime_device_info(struct nouveau_horizon_device *device)
       /* nvhost allocates the GM20B Z-cull context at a 4 KiB boundary. */
       .ctxsw_align = 0x1000,
    };
-   device->info.has_zcull_info = true;
+   info_out->has_zcull_info = true;
 }
 
 static uint32_t
@@ -209,7 +221,7 @@ nouveau_horizon_device_create(
       device->enable_timing = create_info->enable_timing;
    }
    nouveau_horizon_get_gm20b_info(&device->info);
-   nouveau_horizon_add_runtime_device_info(device);
+   nouveau_horizon_add_zcull_info(&device->info);
 
    const nvioctl_gpu_characteristics *gpu_info = nvGpuGetCharacteristics();
    device->page_size_B = nouveau_horizon_choose_page_size(gpu_info);

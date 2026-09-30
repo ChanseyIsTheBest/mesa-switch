@@ -774,6 +774,137 @@ nvk_cmd_buffer_dirty_render_pass(struct nvk_cmd_buffer *cmd)
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
 }
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: batched emission (NVK_SW_M_EMISION); see
+ * nvk_sw_1inc_rapido in nvk_cmd_buffer.h. Here: the guard and the two commands
+ * that are not a ONEINCR with n data words: binding a cbuf and the upload to the
+ * root table without a hardware root table.
+ */
+static bool
+nvk_sw_emitido_igual(const struct nv_push *p, const uint32_t *inicio,
+                     const struct nv_push *b, const uint32_t *b_inicio)
+{
+   const size_t n = p->end - inicio;
+   const size_t nb = b->end - b_inicio;
+   if (n != nb || memcmp(inicio, b_inicio, n * 4) != 0)
+      return false;
+   if (p->last_hdr_dw != b->last_hdr_dw)
+      return false;
+   if (p->last_hdr == NULL || b->last_hdr == NULL)
+      return p->last_hdr == NULL && b->last_hdr == NULL;
+   return (p->last_hdr - inicio) == (b->last_hdr - b_inicio);
+}
+
+static void
+nvk_sw_emision_resultado(struct nvk_cmd_buffer *cmd, bool iguales,
+                         const char *que)
+{
+   if (iguales) {
+      cmd->state.sw.validadas[NVK_SW_M_EMISION]++;
+   } else {
+      cmd->state.sw.modo_emision = NVK_SW_DE_SIEMPRE;
+      nvk_sw_diferencia(cmd, NVK_SW_M_EMISION, que);
+   }
+}
+
+void
+nvk_sw_comprobar_1inc(struct nvk_cmd_buffer *cmd, const struct nv_push *p,
+                      const uint32_t *inicio, uint32_t mthd,
+                      const uint32_t *datos, uint32_t n)
+{
+   uint32_t dw[NVK_SW_BORRADOR];
+   struct nv_push b;
+   if (n + 1 > NVK_SW_BORRADOR) {
+      cmd->state.sw.sin_comprobar[NVK_SW_M_EMISION]++;
+      return;
+   }
+   nv_push_init(&b, dw, ARRAY_SIZE(dw), SUBC_MASK_ALL);
+   nvk_sw_1inc_rapido(&b, mthd, datos, n);
+   nvk_sw_emision_resultado(cmd, nvk_sw_emitido_igual(p, inicio, &b, dw),
+                            "orden ONEINCR");
+}
+
+/* Binding a cbuf: SET_CONSTANT_BUFFER_SELECTOR_A..C (INCR, 3 data words) if
+ * it has a size, and an immediate BIND_GROUP_CONSTANT_BUFFER(g) (valid in bit 0,
+ * shader_slot in 8:4). The caller has reserved 5 dwords.
+ */
+static inline void
+nvk_sw_cbuf_rapido(struct nv_push *p, uint32_t g, uint32_t c,
+                   struct nvk_buffer_address ba)
+{
+   uint32_t *d = p->end;
+   if (ba.size > 0) {
+      d[0] = NVC0_FIFO_PKHDR_SQ(SUBC_NV9097,
+                                NV9097_SET_CONSTANT_BUFFER_SELECTOR_A, 3);
+      d[1] = ba.size;
+      d[2] = (uint32_t)(ba.base_addr >> 32);
+      d[3] = (uint32_t)ba.base_addr;
+      d += 4;
+   }
+   const uint32_t enlace =
+      NVC0_FIFO_PKHDR_IL(SUBC_NV9097, NV9097_BIND_GROUP_CONSTANT_BUFFER(g),
+                         (ba.size > 0 ? 1u : 0u) | (c << 4));
+   d[0] = enlace;
+   p->last_hdr = d;
+   p->last_hdr_dw = enlace;
+   p->end = d + 1;
+}
+
+static void
+nvk_sw_comprobar_cbuf(struct nvk_cmd_buffer *cmd, const struct nv_push *p,
+                      const uint32_t *inicio, uint32_t g, uint32_t c,
+                      struct nvk_buffer_address ba)
+{
+   uint32_t dw[NVK_SW_BORRADOR];
+   struct nv_push b;
+   nv_push_init(&b, dw, ARRAY_SIZE(dw), SUBC_MASK_ALL);
+   nvk_sw_cbuf_rapido(&b, g, c, ba);
+   nvk_sw_emision_resultado(cmd, nvk_sw_emitido_igual(p, inicio, &b, dw),
+                            "enlace de cbuf");
+}
+
+/* The upload to the root table without a hardware root table: ONEINCR to
+ * LOAD_CONSTANT_BUFFER_OFFSET with the offset and the n data words after it (they go
+ * to LOAD_CONSTANT_BUFFER(0)). The caller has reserved 2 + n dwords.
+ */
+static inline void
+nvk_sw_raiz_rapido(struct nv_push *p, uint32_t desplazamiento,
+                   const uint32_t *datos, uint32_t n)
+{
+   uint32_t *d = p->end;
+   const uint32_t cabecera =
+      NVC0_FIFO_PKHDR_1I(SUBC_NV9097, NV9097_LOAD_CONSTANT_BUFFER_OFFSET, n + 1);
+   d[0] = cabecera;
+   d[1] = desplazamiento;
+   if (n <= 8) {
+      for (uint32_t i = 0; i < n; i++)
+         d[2 + i] = datos[i];
+   } else {
+      memcpy(&d[2], datos, n * 4);
+   }
+   p->last_hdr = d;
+   p->last_hdr_dw = cabecera;
+   p->end = d + 2 + n;
+}
+
+static void
+nvk_sw_comprobar_raiz(struct nvk_cmd_buffer *cmd, const struct nv_push *p,
+                      const uint32_t *inicio, uint32_t desplazamiento,
+                      const uint32_t *datos, uint32_t n)
+{
+   uint32_t dw[NVK_SW_BORRADOR];
+   struct nv_push b;
+   if (n + 2 > NVK_SW_BORRADOR) {
+      cmd->state.sw.sin_comprobar[NVK_SW_M_EMISION]++;
+      return;
+   }
+   nv_push_init(&b, dw, ARRAY_SIZE(dw), SUBC_MASK_ALL);
+   nvk_sw_raiz_rapido(&b, desplazamiento, datos, n);
+   nvk_sw_emision_resultado(cmd, nvk_sw_emitido_igual(p, inicio, &b, dw),
+                            "subida a la tabla raiz");
+}
+#endif
+
 static void
 nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
                             struct nvk_descriptor_state *desc,
@@ -785,6 +916,12 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
    const uint32_t start_dw = offset / 4;
    const uint32_t end_dw = DIV_ROUND_UP(offset + size, 4);
    const uint32_t *root_dw = (uint32_t *)desc->root;
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: all are counted; 1 of every N is measured */
+   cmd->state.sw.cuentas[NVK_SW_C_RAIZ]++;
+   cmd->state.sw.cuentas[NVK_SW_C_RAIZ_DWORDS] += end_dw - start_dw;
+   const uint64_t t_sw = nvk_sw_toca_medir(cmd, NVK_SW_T_RAIZ) ? nvk_sw_ticks() : 0;
+#endif
 
    if (nvk_use_hw_root_table(&pdev->info, true)) {
       const uint32_t TABLE_SIZE_DW = NVK_HW_ROOT_TABLE_SIZE / sizeof(uint32_t);
@@ -813,11 +950,29 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
       const uint32_t len_dw = end_dw - start_dw;
 
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + len_dw);
+#ifdef HAVE_SWITCH_PLATFORM
+      /* NFSMW: NVK_SW_M_EMISION, the same command written at once */
+      const int modo_sw = cmd->state.sw.modo_emision;
+      uint32_t *const inicio_sw = p->end;
+      if (modo_sw == NVK_SW_RAPIDO) {
+         nvk_sw_raiz_rapido(p, start_dw * 4, &root_dw[start_dw], len_dw);
+      } else
+#endif
+      {
       P_1INC(p, NV9097, LOAD_CONSTANT_BUFFER_OFFSET);
       P_NV9097_LOAD_CONSTANT_BUFFER_OFFSET(p, start_dw * 4);
 
       P_INLINE_ARRAY(p, &root_dw[start_dw], len_dw);
+#ifdef HAVE_SWITCH_PLATFORM
+      if (modo_sw == NVK_SW_COMPROBAR)
+         nvk_sw_comprobar_raiz(cmd, p, inicio_sw, start_dw * 4,
+                               &root_dw[start_dw], len_dw);
+#endif
+      }
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_parte(cmd, NVK_SW_P_RAIZ, t_sw); /* NFSMW */
+#endif
 }
 
 void
@@ -848,6 +1003,10 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
    }
 
    cmd->state.gfx.descriptors.flush_root = nvk_cmd_flush_gfx_root_desc;
+   cmd->state.gfx.descriptors.dyn_start_synced = false; /* NFSMW */
+#ifdef HAVE_SWITCH_PLATFORM
+   cmd->state.gfx.descriptors.dyn_synced = 0; /* NFSMW */
+#endif
 
    if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
        (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
@@ -1939,6 +2098,32 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
 }
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: prefetch (NVK_SW_M_PRECARGA). PRFM only. */
+static inline void
+nvk_sw_precargar_bytes(const void *p, size_t bytes)
+{
+   const char *c = p;
+   if (p == NULL || bytes == 0)
+      return;
+   for (size_t i = 0; i < bytes; i += 64)
+      __builtin_prefetch(c + i, 0, 3);
+   __builtin_prefetch(c + bytes - 1, 0, 3);
+}
+
+/* What nvk_cmd_flush_gfx_shaders will read from a new shader: the cbuf
+ * map and the fields of its commands (the commands, when the flush starts).
+ */
+static inline void
+nvk_sw_precargar_shader(const struct nvk_shader *shader)
+{
+   nvk_sw_precargar_bytes(&shader->cbuf_map, sizeof(shader->cbuf_map));
+   nvk_sw_precargar_bytes(&shader->push_dw_count,
+                          (const char *)(&shader->push_dw + 1) -
+                          (const char *)&shader->push_dw_count);
+}
+#endif
+
 void
 nvk_cmd_bind_graphics_shader(struct nvk_cmd_buffer *cmd,
                              const mesa_shader_stage stage,
@@ -1959,6 +2144,13 @@ nvk_cmd_bind_graphics_shader(struct nvk_cmd_buffer *cmd,
 
    cmd->state.gfx.shaders[stage] = shader;
    cmd->state.gfx.shaders_dirty |= mesa_to_vk_shader_stage(stage);
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_PRECARGA */
+   if (shader != NULL && nvk_sw_activa(cmd, NVK_SW_M_PRECARGA)) {
+      cmd->state.sw.usos[NVK_SW_M_PRECARGA]++;
+      nvk_sw_precargar_shader(shader);
+   }
+#endif
 }
 
 #define NVK_MME_TESS_PARAMS(domain, spacing, prims) \
@@ -2303,11 +2495,70 @@ const struct nvk_mme_test_case nvk_mme_set_tess_params_tests[] = {{
 },
 {}};
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: NVK_SW_M_CBUFS. The same loop as at the start of
+ * nvk_cmd_flush_gfx_cbufs; nvk_cmd_flush_gfx_shaders uses it to leave the result
+ * computed every time the shaders change.
+ */
+static void
+nvk_sw_buscar_cbuf_shaders(const struct nvk_cmd_buffer *cmd,
+                           const struct nvk_shader *cbuf_shaders[5])
+{
+   const struct nvk_shader *mesh_shader =
+      cmd->state.gfx.shaders[MESA_SHADER_MESH];
+   const bool has_task_shader =
+      mesh_shader != NULL && mesh_shader->info.mesh.has_task_shader;
+
+   for (uint32_t g = 0; g < 5; g++)
+      cbuf_shaders[g] = NULL;
+   for (mesa_shader_stage stage = 0; stage < MESA_SHADER_MESH_STAGES; stage++) {
+      const struct nvk_shader *shader = cmd->state.gfx.shaders[stage];
+      if (shader == NULL)
+         continue;
+
+      uint32_t group = nvk_cbuf_binding_for_stage(stage, has_task_shader);
+      assert(group < 5);
+      cbuf_shaders[group] = shader;
+   }
+}
+
+/* Does no cbuf in use (within cbuf_count) have its dirty bit set? */
+static inline bool
+nvk_sw_cbufs_estan_limpios(const struct nvk_cmd_buffer *cmd,
+                           const struct nvk_shader *const cbuf_shaders[5])
+{
+   for (uint32_t g = 0; g < 5; g++) {
+      if (cbuf_shaders[g] != NULL &&
+          (cmd->state.gfx.cbuf_groups[g].dirty &
+           BITFIELD_MASK(cbuf_shaders[g]->cbuf_map.cbuf_count)))
+         return false;
+   }
+   return true;
+}
+#endif
+
 void
 nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
 {
    if (cmd->state.gfx.shaders_dirty == 0)
       return;
+
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_PRECARGA: the commands of the dirty shaders,
+    * before comparing their cbuf maps.
+    */
+   if (nvk_sw_activa(cmd, NVK_SW_M_PRECARGA)) {
+      u_foreach_bit(s, cmd->state.gfx.shaders_dirty & NVK_SHADER_STAGE_GRAPHICS_BITS) {
+         const struct nvk_shader *sh =
+            cmd->state.gfx.shaders[vk_to_mesa_shader_stage(1 << s)];
+         if (sh != NULL) {
+            nvk_sw_precargar_bytes(sh->push_dw,
+                                   (size_t)MAX2(sh->push_dw_count,
+                                                sh->vtgm_push_dw_count) * 4);
+         }
+      }
+   }
+#endif
 
    /* Map shader types to shaders */
    struct nvk_shader *type_shader[6] = { NULL, };
@@ -2346,6 +2597,10 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
                        sizeof(cbuf_group->cbufs[i])) != 0) {
                cbuf_group->cbufs[i] = cbuf_map->cbufs[i];
                cbuf_group->dirty |= BITFIELD_BIT(i);
+#ifdef HAVE_SWITCH_PLATFORM
+               /* NFSMW: the set 4 masks */
+               nvk_switch_set4_anotar_tipo(cbuf_group, i);
+#endif
             }
          }
       }
@@ -2394,6 +2649,14 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
       nv_push_raw(p, &last_vtgm->push_dw[dw_start], dw_count);
    }
 
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_CBUFS: the shader of each cbuf group, and the cbufs
+    * marked as not known to be clean (the maps may have changed).
+    */
+   nvk_sw_buscar_cbuf_shaders(cmd, cmd->state.gfx.sw_cbuf_shaders);
+   cmd->state.gfx.sw_cbuf_shaders_validos = true;
+   cmd->state.gfx.sw_cbufs_limpios = false;
+#endif
    cmd->state.gfx.shaders_dirty = 0;
 }
 
@@ -4214,6 +4477,143 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
    }
 }
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: dynamic state by dirty groups
+ * (NVK_SW_M_DINAMICO). The bits of each nvk_flush_*_state, copied from their
+ * BITSET_TEST. All of them are below 64 (the asserts below).
+ */
+#define NVK_SW_DYN(e) (UINT64_C(1) << MESA_VK_DYNAMIC_##e)
+
+static const uint64_t nvk_sw_dyn_vi =
+   NVK_SW_DYN(VI) | NVK_SW_DYN(VI_BINDINGS_VALID) |
+   NVK_SW_DYN(VI_BINDING_STRIDES);
+static const uint64_t nvk_sw_dyn_ia =
+   NVK_SW_DYN(IA_PRIMITIVE_TOPOLOGY) | NVK_SW_DYN(IA_PRIMITIVE_RESTART_ENABLE);
+static const uint64_t nvk_sw_dyn_ts =
+   NVK_SW_DYN(TS_PATCH_CONTROL_POINTS) | NVK_SW_DYN(TS_DOMAIN_ORIGIN);
+static const uint64_t nvk_sw_dyn_vp =
+   NVK_SW_DYN(VP_VIEWPORTS) | NVK_SW_DYN(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) |
+   NVK_SW_DYN(VP_DEPTH_CLAMP_RANGE) | NVK_SW_DYN(VP_SCISSOR_COUNT) |
+   NVK_SW_DYN(VP_SCISSORS) | NVK_SW_DYN(FSR);
+static const uint64_t nvk_sw_dyn_dr =
+   NVK_SW_DYN(DR_ENABLE) | NVK_SW_DYN(DR_MODE) | NVK_SW_DYN(DR_RECTANGLES);
+static const uint64_t nvk_sw_dyn_rs =
+   NVK_SW_DYN(RS_RASTERIZER_DISCARD_ENABLE) | NVK_SW_DYN(RS_DEPTH_CLIP_ENABLE) |
+   NVK_SW_DYN(RS_DEPTH_CLAMP_ENABLE) | NVK_SW_DYN(RS_POLYGON_MODE) |
+   NVK_SW_DYN(RS_CULL_MODE) | NVK_SW_DYN(RS_FRONT_FACE) |
+   NVK_SW_DYN(RS_PROVOKING_VERTEX) | NVK_SW_DYN(RS_DEPTH_BIAS_ENABLE) |
+   NVK_SW_DYN(RS_DEPTH_BIAS_FACTORS) | NVK_SW_DYN(RS_LINE_WIDTH) |
+   NVK_SW_DYN(RS_LINE_MODE) | NVK_SW_DYN(RS_LINE_STIPPLE_ENABLE) |
+   NVK_SW_DYN(RS_LINE_STIPPLE) | NVK_SW_DYN(RS_RASTERIZATION_STREAM) |
+   NVK_SW_DYN(RS_CONSERVATIVE_MODE) |
+   NVK_SW_DYN(RS_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE);
+static const uint64_t nvk_sw_dyn_fsr = NVK_SW_DYN(FSR);
+static const uint64_t nvk_sw_dyn_ms =
+   NVK_SW_DYN(MS_RASTERIZATION_SAMPLES) |
+   NVK_SW_DYN(MS_ALPHA_TO_COVERAGE_ENABLE) |
+   NVK_SW_DYN(MS_ALPHA_TO_ONE_ENABLE) | NVK_SW_DYN(MS_SAMPLE_LOCATIONS) |
+   NVK_SW_DYN(MS_SAMPLE_LOCATIONS_ENABLE) | NVK_SW_DYN(MS_SAMPLE_MASK);
+static const uint64_t nvk_sw_dyn_ds =
+   NVK_SW_DYN(DS_DEPTH_TEST_ENABLE) | NVK_SW_DYN(DS_DEPTH_WRITE_ENABLE) |
+   NVK_SW_DYN(DS_DEPTH_COMPARE_OP) | NVK_SW_DYN(DS_DEPTH_BOUNDS_TEST_ENABLE) |
+   NVK_SW_DYN(DS_DEPTH_BOUNDS_TEST_BOUNDS) | NVK_SW_DYN(DS_STENCIL_TEST_ENABLE) |
+   NVK_SW_DYN(DS_STENCIL_OP) | NVK_SW_DYN(DS_STENCIL_COMPARE_MASK) |
+   NVK_SW_DYN(DS_STENCIL_WRITE_MASK) | NVK_SW_DYN(DS_STENCIL_REFERENCE);
+static const uint64_t nvk_sw_dyn_cb =
+   NVK_SW_DYN(CB_LOGIC_OP_ENABLE) | NVK_SW_DYN(CB_LOGIC_OP) |
+   NVK_SW_DYN(CB_BLEND_ENABLES) | NVK_SW_DYN(CB_BLEND_EQUATIONS) |
+   NVK_SW_DYN(CB_WRITE_MASKS) | NVK_SW_DYN(CB_COLOR_WRITE_ENABLES) |
+   NVK_SW_DYN(RP_ATTACHMENTS) | NVK_SW_DYN(COLOR_ATTACHMENT_MAP) |
+   NVK_SW_DYN(CB_BLEND_CONSTANTS);
+
+/* Guard: a function without dirty bits should not emit anything. Everything it
+ * may request is reserved first (so that it does not switch chunks inside) and
+ * the pushbuf is checked not to advance. Whatever it emits stays: it is the usual output.
+ */
+static ATTRIBUTE_NOINLINE void
+nvk_sw_dinamico_vacio(struct nvk_cmd_buffer *cmd,
+                      void (*flush)(struct nvk_cmd_buffer *cmd),
+                      bool *iguales)
+{
+   nvk_cmd_buffer_push(cmd, NVK_CMD_BUFFER_MAX_PUSH);
+   const uint32_t *antes = cmd->push.end;
+   flush(cmd);
+   if (cmd->push.end != antes)
+      *iguales = false;
+}
+
+static void
+nvk_sw_flush_dinamico_por_grupos(struct nvk_cmd_buffer *cmd,
+                                 struct vk_dynamic_graphics_state *dyn)
+{
+   STATIC_ASSERT(BITSET_WORDBITS == 32);
+   STATIC_ASSERT(MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP < 64);
+   STATIC_ASSERT(MESA_VK_DYNAMIC_RP_ATTACHMENTS < 64);
+   STATIC_ASSERT(MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS < 64);
+   STATIC_ASSERT(MESA_VK_DYNAMIC_DS_STENCIL_REFERENCE < 64);
+
+   /* Bits 0-63; no function looks at bit 64 (CB_BLEND_ADVANCED). */
+   const uint64_t sucios =
+      (uint64_t)dyn->dirty[0] | ((uint64_t)dyn->dirty[1] << 32);
+
+   cmd->state.sw.usos[NVK_SW_M_DINAMICO]++;
+   const bool comprobar = nvk_sw_toca_comprobar(cmd, NVK_SW_M_DINAMICO);
+   bool iguales = true;
+
+   /* In the same order as always */
+   if (sucios & nvk_sw_dyn_vi)
+      nvk_flush_vi_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_vi_state, &iguales);
+   if (sucios & nvk_sw_dyn_ia)
+      nvk_flush_ia_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_ia_state, &iguales);
+   if (sucios & nvk_sw_dyn_ts)
+      nvk_flush_ts_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_ts_state, &iguales);
+   if (sucios & nvk_sw_dyn_vp)
+      nvk_flush_vp_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_vp_state, &iguales);
+   if (sucios & nvk_sw_dyn_dr)
+      nvk_flush_dr_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_dr_state, &iguales);
+   if (sucios & nvk_sw_dyn_rs)
+      nvk_flush_rs_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_rs_state, &iguales);
+   if (sucios & nvk_sw_dyn_fsr)
+      nvk_flush_fsr_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_fsr_state, &iguales);
+   if (sucios & nvk_sw_dyn_ms)
+      nvk_flush_ms_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_ms_state, &iguales);
+   if (sucios & nvk_sw_dyn_ds)
+      nvk_flush_ds_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_ds_state, &iguales);
+   if (sucios & nvk_sw_dyn_cb)
+      nvk_flush_cb_state(cmd);
+   else if (unlikely(comprobar))
+      nvk_sw_dinamico_vacio(cmd, nvk_flush_cb_state, &iguales);
+
+   if (unlikely(comprobar)) {
+      if (iguales)
+         cmd->state.sw.validadas[NVK_SW_M_DINAMICO]++;
+      else
+         nvk_sw_diferencia(cmd, NVK_SW_M_DINAMICO,
+                           "una funcion de estado dinamico emitio sin bits sucios");
+   }
+
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+}
+#endif
+
 void
 nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd)
 {
@@ -4222,6 +4622,14 @@ nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd)
 
    if (!vk_dynamic_graphics_state_any_dirty(dyn))
       return;
+
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_DINAMICO: only the groups with dirty bits */
+   if (nvk_sw_activa(cmd, NVK_SW_M_DINAMICO)) {
+      nvk_sw_flush_dinamico_por_grupos(cmd, dyn);
+      return;
+   }
+#endif
 
    nvk_flush_vi_state(cmd);
    nvk_flush_ia_state(cmd);
@@ -4324,6 +4732,78 @@ nvk_mme_bind_cbuf_desc(struct mme_builder *b)
    mme_emit(b, cb);
 }
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: the guard of set 4 by differences.
+ *
+ * With the new path, a DYNAMIC_UBO cbuf that is not dirty must still be
+ * bound to what root says now. It is checked against what was really sent
+ * to that slot (bound_addr and bound_size), not against the reasoning
+ * that decided not to dirty it. In the first NVK_SWITCH_SET4_A_COMPROBAR
+ * draws of the process and then in 1 of every 4,096 of each command buffer.
+ * On a difference: that slot and all DYNAMIC_UBO ones of all groups
+ * are dirtied (this same draw and the following ones come out right), it is counted,
+ * DIFERENCIA on stderr and the new path is turned off for the session.
+ */
+#define NVK_SWITCH_SET4_A_COMPROBAR 200000
+
+static inline bool
+nvk_switch_set4_toca_comprobar(struct nvk_cmd_buffer *cmd)
+{
+   if (!nvk_switch_set4_activo())
+      return false;
+
+   const uint64_t n = ++cmd->state.set4.dibujos;
+   /* NFSMW: 1 of every 4,096 with the process-wide count. With the
+    * buffer's count (n & 4095) it never checked: no command buffer reaches
+    * 4,096 draws (an earlier version checked 386,000 cbufs in the first 200,000
+    * draws, with no difference, and 0 for the rest of the session).
+    */
+   const uint64_t total = p_atomic_read_relaxed(&nvk_switch_set4.total.dibujos) + n;
+   return total <= NVK_SWITCH_SET4_A_COMPROBAR || (total & 4095) == 0;
+}
+
+static void
+nvk_switch_set4_comprobar(struct nvk_cmd_buffer *cmd,
+                          const struct nvk_descriptor_state *desc,
+                          const struct nvk_shader *shader,
+                          struct nvk_cbuf_group *group, uint32_t g,
+                          uint32_t cbuf_count, uint32_t min_cbuf_alignment)
+{
+   unsigned pendientes = group->dyn_ubo_slots & ~group->dirty &
+                         BITFIELD_MASK(cbuf_count);
+   while (pendientes) {
+      const unsigned c = u_bit_scan(&pendientes);
+      struct nvk_buffer_address ba;
+      if (!nvk_cmd_buffer_get_cbuf_addr(cmd, desc, shader, &group->cbufs[c], &ba))
+         continue;
+
+      ba.size = align(ba.size, min_cbuf_alignment);
+      ba.size = MIN2(ba.size, NVK_MAX_CBUF_SIZE);
+      cmd->state.set4.comprobaciones++;
+      if (ba.size == group->bound_size[c] &&
+          (ba.size == 0 || ba.base_addr == group->bound_addr[c]))
+         continue;
+
+      group->dirty |= BITFIELD_BIT(c);
+      cmd->state.set4.diferencias++;
+      /* And all DYNAMIC_UBO ones of all groups, to be rebound: from here on
+       * the usual path is in charge and nothing bound by the new one remains.
+       */
+      for (uint32_t h = 0; h < ARRAY_SIZE(cmd->state.gfx.cbuf_groups); h++)
+         cmd->state.gfx.cbuf_groups[h].dirty |= cmd->state.gfx.cbuf_groups[h].dyn_ubo_slots;
+      if (p_atomic_xchg(&nvk_switch_set4.apagado, 1) == 0) {
+         fprintf(stderr,
+                 "[nvk] set 4 por diferencias: DIFERENCIA en el grupo %u, cbuf %u "
+                 "(enlazado 0x%llx+%u, pedido 0x%llx+%u): se arregla este dibujo "
+                 "y se apaga para el resto de la sesion\n",
+                 g, c, (unsigned long long)group->bound_addr[c],
+                 group->bound_size[c], (unsigned long long)ba.base_addr,
+                 ba.size);
+      }
+   }
+}
+#endif
+
 void
 nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
 {
@@ -4332,13 +4812,29 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
    const uint32_t min_cbuf_alignment = nvk_min_cbuf_alignment(&pdev->info);
    struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
 
+   /* Find cbuf maps for the 5 cbuf groups */
+   const struct nvk_shader *cbuf_shaders[5] = { NULL, };
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_CBUFS. The shader of each group is left
+    * computed by nvk_cmd_flush_gfx_shaders when the shaders change; the
+    * guard recomputes it with the usual loop and compares.
+    */
+   bool sw_cbufs = false, sw_comprobar = false;
+   if (nvk_sw_activa(cmd, NVK_SW_M_CBUFS) &&
+       cmd->state.gfx.sw_cbuf_shaders_validos) {
+      sw_cbufs = true;
+      cmd->state.sw.usos[NVK_SW_M_CBUFS]++;
+      sw_comprobar = nvk_sw_toca_comprobar(cmd, NVK_SW_M_CBUFS);
+   }
+   if (sw_cbufs && !sw_comprobar) {
+      memcpy(cbuf_shaders, cmd->state.gfx.sw_cbuf_shaders, sizeof(cbuf_shaders));
+   } else {
+#endif
    const struct nvk_shader *mesh_shader =
       cmd->state.gfx.shaders[MESA_SHADER_MESH];
    const bool has_task_shader =
       mesh_shader != NULL && mesh_shader->info.mesh.has_task_shader;
 
-   /* Find cbuf maps for the 5 cbuf groups */
-   const struct nvk_shader *cbuf_shaders[5] = { NULL, };
    for (mesa_shader_stage stage = 0; stage < MESA_SHADER_MESH_STAGES; stage++) {
       const struct nvk_shader *shader = cmd->state.gfx.shaders[stage];
       if (shader == NULL)
@@ -4348,7 +4844,37 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
       assert(group < ARRAY_SIZE(cbuf_shaders));
       cbuf_shaders[group] = shader;
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   if (sw_comprobar) {
+      if (memcmp(cmd->state.gfx.sw_cbuf_shaders, cbuf_shaders,
+                 sizeof(cbuf_shaders)) == 0) {
+         cmd->state.sw.validadas[NVK_SW_M_CBUFS]++;
+      } else {
+         nvk_sw_diferencia(cmd, NVK_SW_M_CBUFS, "mapa de grupos de cbufs");
+         sw_cbufs = false;
+      }
+   }
+   }
+#endif
 
+#ifdef HAVE_SWITCH_PLATFORM
+   const bool comprobar_set4 = nvk_switch_set4_toca_comprobar(cmd); /* NFSMW */
+
+   /* NFSMW: NVK_SW_M_CBUFS. With no dirty cbuf in use, the
+    * loop below neither emits nor changes anything: it is skipped. The guard checks
+    * that nothing is really dirty and runs the loop as always.
+    */
+   const bool sw_limpios = sw_cbufs && cmd->state.gfx.sw_cbufs_limpios &&
+                           !comprobar_set4;
+   if (sw_limpios) {
+      if (!sw_comprobar)
+         return;
+      if (nvk_sw_cbufs_estan_limpios(cmd, cbuf_shaders))
+         cmd->state.sw.validadas[NVK_SW_M_CBUFS]++;
+      else
+         nvk_sw_diferencia(cmd, NVK_SW_M_CBUFS, "cbufs marcados limpios con algo sucio");
+   }
+#endif
    bool bound_any_cbuf = false;
    for (uint32_t g = 0; g < ARRAY_SIZE(cbuf_shaders); g++) {
       if (cbuf_shaders[g] == NULL)
@@ -4358,6 +4884,12 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
       const struct nvk_cbuf_map *cbuf_map = &shader->cbuf_map;
       struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
 
+#ifdef HAVE_SWITCH_PLATFORM
+      if (unlikely(comprobar_set4)) {
+         nvk_switch_set4_comprobar(cmd, desc, shader, group, g,
+                                   cbuf_map->cbuf_count, min_cbuf_alignment);
+      }
+#endif
       /* We only bother to re-bind cbufs that are in use */
       const uint32_t rebind =
          group->dirty & BITFIELD_MASK(cbuf_map->cbuf_count);
@@ -4372,6 +4904,10 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
             continue;
 
          bound_any_cbuf = true;
+#ifdef HAVE_SWITCH_PLATFORM
+         if (unlikely(cmd->state.sw.midiendo)) /* NFSMW */
+            cmd->state.sw.cuentas[NVK_SW_C_CBUFS_REENLAZADOS]++;
+#endif
 
          struct nvk_buffer_address ba;
          if (nvk_cmd_buffer_get_cbuf_addr(cmd, desc, shader, cbuf, &ba)) {
@@ -4381,6 +4917,15 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
 
             struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
 
+#ifdef HAVE_SWITCH_PLATFORM
+            /* NFSMW: NVK_SW_M_EMISION, the same command written at once */
+            const int modo_sw = cmd->state.sw.modo_emision;
+            uint32_t *const inicio_sw = p->end;
+            if (modo_sw == NVK_SW_RAPIDO) {
+               nvk_sw_cbuf_rapido(p, g, c, ba);
+            } else
+#endif
+            {
             if (ba.size > 0) {
                P_MTHD(p, NV9097, SET_CONSTANT_BUFFER_SELECTOR_A);
                P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_A(p, ba.size);
@@ -4392,6 +4937,16 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
                .valid = ba.size > 0,
                .shader_slot = c,
             });
+#ifdef HAVE_SWITCH_PLATFORM
+            if (modo_sw == NVK_SW_COMPROBAR)
+               nvk_sw_comprobar_cbuf(cmd, p, inicio_sw, g, c, ba);
+#endif
+            }
+#ifdef HAVE_SWITCH_PLATFORM
+            /* NFSMW: what was bound, for the guard */
+            group->bound_addr[c] = ba.base_addr;
+            group->bound_size[c] = ba.size;
+#endif
          } else {
             uint64_t desc_addr =
                nvk_cmd_buffer_get_cbuf_descriptor_addr(cmd, desc, cbuf);
@@ -4439,7 +4994,155 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
       P_INLINE_DATA(p, 0);
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_CBUFS: as they end up (the set 4 guard
+    * may have dirtied groups that were already walked).
+    */
+   if (sw_cbufs)
+      cmd->state.gfx.sw_cbufs_limpios = nvk_sw_cbufs_estan_limpios(cmd, cbuf_shaders);
+#endif
 }
+
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: per-part measurement (see nvk_switch_dibujo in
+ * nvk_cmd_buffer.c). None of this changes a command or a state.
+ */
+static void
+nvk_sw_tocar(const void *p, size_t bytes)
+{
+   const volatile uint8_t *b = p;
+   if (p == NULL || bytes == 0)
+      return;
+   for (size_t i = 0; i < bytes; i += 64)
+      (void)b[i];
+   (void)b[bytes - 1];
+}
+
+/* medir_fallos: reads what nvk_cmd_flush_gfx_shaders is going to read from the
+ * dirty shaders (cbuf map and commands), to measure the misses separately.
+ */
+static void
+nvk_sw_tocar_shaders(const struct nvk_cmd_buffer *cmd)
+{
+   u_foreach_bit(s, cmd->state.gfx.shaders_dirty & NVK_SHADER_STAGE_GRAPHICS_BITS) {
+      const mesa_shader_stage stage = vk_to_mesa_shader_stage(1 << s);
+      const struct nvk_shader *shader = cmd->state.gfx.shaders[stage];
+      if (shader == NULL)
+         continue;
+      nvk_sw_tocar(&shader->cbuf_map, sizeof(shader->cbuf_map));
+      nvk_sw_tocar(&shader->push_dw_count,
+                   (const char *)(&shader->push_dw + 1) -
+                   (const char *)&shader->push_dw_count);
+      nvk_sw_tocar(shader->push_dw,
+                   (size_t)MAX2(shader->push_dw_count,
+                                shader->vtgm_push_dw_count) * 4);
+   }
+}
+
+static void
+nvk_sw_contar_antes_del_flush(struct nvk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   uint32_t bits = 0;
+   for (uint32_t w = 0; w < ARRAY_SIZE(dyn->dirty); w++)
+      bits += util_bitcount(dyn->dirty[w]);
+   if (bits > 0) {
+      cmd->state.sw.cuentas[NVK_SW_C_DIN_CON_TRABAJO]++;
+      cmd->state.sw.cuentas[NVK_SW_C_DIN_BITS] += bits;
+   }
+   if (cmd->state.gfx.shaders_dirty != 0)
+      cmd->state.sw.cuentas[NVK_SW_C_SHADERS_SUCIOS]++;
+}
+
+/* Starts a draw: if it is due to be measured, marks the buffer and returns the
+ * current tick; otherwise 0.
+ */
+static inline uint64_t
+nvk_sw_empezar_dibujo(struct nvk_cmd_buffer *cmd)
+{
+   if (likely(!nvk_sw_toca_medir(cmd, NVK_SW_T_DIBUJO)))
+      return 0;
+   cmd->state.sw.midiendo = true;
+   cmd->state.sw.dw_inicio = cmd->push.end;
+   cmd->state.sw.mem_inicio = cmd->push_mem;
+   return nvk_sw_ticks();
+}
+
+static inline void
+nvk_sw_terminar_dibujo(struct nvk_cmd_buffer *cmd, uint64_t t0)
+{
+   if (likely(t0 == 0))
+      return;
+   nvk_sw_parte(cmd, NVK_SW_P_DIBUJO, t0);
+   cmd->state.sw.cuentas[NVK_SW_C_DIBUJOS_MEDIDOS]++;
+   if (cmd->push_mem == cmd->state.sw.mem_inicio &&
+       cmd->push.end >= cmd->state.sw.dw_inicio)
+      cmd->state.sw.cuentas[NVK_SW_C_DWORDS_DIBUJO] +=
+         cmd->push.end - cmd->state.sw.dw_inicio;
+   cmd->state.sw.midiendo = false;
+}
+
+/* The usual copy of the pipeline's fixed state
+ * (vk_cmd_set_dynamic_graphics_state), measured in 1 of every N binds. In the
+ * measured ones, it also records whether the copy changed nothing (no values, no
+ * set, no dirty, no vertex input, no sample positions) and how many new dirty
+ * bits it left.
+ * The copies taken before and after, for that comparison, are kept outside
+ * the measured part.
+ */
+static ATTRIBUTE_NOINLINE void
+nvk_sw_copia_medida(struct nvk_cmd_buffer *cmd,
+                    const struct vk_dynamic_graphics_state *state)
+{
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   if (cmd->state.sw.medir_fallos) {
+      const uint64_t t = nvk_sw_ticks();
+      nvk_sw_tocar(state, sizeof(*state));
+      nvk_sw_tocar(state->vi, sizeof(*state->vi));
+      nvk_sw_tocar(state->ms.sample_locations,
+                   sizeof(*state->ms.sample_locations));
+      nvk_sw_parte(cmd, NVK_SW_P_PIPE_TOQUE, t);
+   }
+
+   struct vk_dynamic_graphics_state antes;
+   struct vk_vertex_input_state vi_antes;
+   struct vk_sample_locations_state sl_antes;
+   memcpy(&antes, dyn, sizeof(antes));
+   memcpy(&vi_antes, &cmd->state.gfx._dynamic_vi, sizeof(vi_antes));
+   memcpy(&sl_antes, &cmd->state.gfx._dynamic_sl, sizeof(sl_antes));
+
+   const uint64_t t0 = nvk_sw_ticks();
+   vk_cmd_set_dynamic_graphics_state(&cmd->vk, state);
+   nvk_sw_parte(cmd, NVK_SW_P_PIPE_COPIA, t0);
+
+   cmd->state.sw.cuentas[NVK_SW_C_PIPES_MEDIDOS]++;
+   uint32_t nuevos = 0;
+   for (uint32_t w = 0; w < ARRAY_SIZE(dyn->dirty); w++)
+      nuevos += util_bitcount(dyn->dirty[w] & ~antes.dirty[w]);
+   cmd->state.sw.cuentas[NVK_SW_C_PIPES_BITS_NUEVOS] += nuevos;
+   if (memcmp(&antes, dyn, sizeof(antes)) == 0 &&
+       memcmp(&vi_antes, &cmd->state.gfx._dynamic_vi, sizeof(vi_antes)) == 0 &&
+       memcmp(&sl_antes, &cmd->state.gfx._dynamic_sl, sizeof(sl_antes)) == 0)
+      cmd->state.sw.cuentas[NVK_SW_C_PIPES_SIN_EFECTO]++;
+}
+
+void
+nvk_sw_cmd_set_dynamic_graphics_state(struct vk_command_buffer *vk_cmd,
+                                      const struct vk_dynamic_graphics_state *state)
+{
+   struct nvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct nvk_cmd_buffer, vk);
+
+   if (likely(!cmd->state.sw.midiendo_pipe)) {
+      vk_cmd_set_dynamic_graphics_state(vk_cmd, state);
+      return;
+   }
+   cmd->state.sw.midiendo_pipe = false;
+   nvk_sw_copia_medida(cmd, state);
+}
+#endif
 
 static void
 nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
@@ -4454,10 +5157,37 @@ nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
                                        dev->interlock_memory->va->addr);
       }
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: per-part measurement (only in the measured draws) */
+   if (unlikely(cmd->state.sw.midiendo))
+      nvk_sw_contar_antes_del_flush(cmd);
+   uint64_t t_sw = nvk_sw_t0(cmd);
+   /* NFSMW: NVK_SW_M_CBUFS: with no bits in push_dirty the function
+    * does nothing (it only walks those bits).
+    */
+   if (!nvk_sw_activa(cmd, NVK_SW_M_CBUFS) ||
+       cmd->state.gfx.descriptors.push_dirty != 0)
+#endif
    nvk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.gfx.descriptors);
+#ifdef HAVE_SWITCH_PLATFORM
+   t_sw = nvk_sw_parte(cmd, NVK_SW_P_PUSH_DESC, t_sw);
+#endif
    nvk_cmd_flush_gfx_dynamic_state(cmd);
+#ifdef HAVE_SWITCH_PLATFORM
+   t_sw = nvk_sw_parte(cmd, NVK_SW_P_DINAMICO, t_sw);
+   if (unlikely(t_sw != 0 && cmd->state.sw.medir_fallos)) {
+      nvk_sw_tocar_shaders(cmd);
+      t_sw = nvk_sw_parte(cmd, NVK_SW_P_TOQUE_SHADERS, t_sw);
+   }
+#endif
    nvk_cmd_flush_gfx_shaders(cmd);
+#ifdef HAVE_SWITCH_PLATFORM
+   t_sw = nvk_sw_parte(cmd, NVK_SW_P_SHADERS, t_sw);
+#endif
    nvk_cmd_flush_gfx_cbufs(cmd);
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_parte(cmd, NVK_SW_P_CBUFS, t_sw);
+#endif
 
    if (NAK_CAN_PRINTF)
       nvk_cmd_buffer_flush_printf_buffer(cmd, &cmd->state.gfx.descriptors);
@@ -4674,12 +5404,31 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
       cmd->state.gfx.vb0 = addr_range;
 
    struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_EMISION, the same command written at once */
+   const uint32_t datos_sw[4] = {
+      vb_idx, (uint32_t)(addr_range.address >> 32),
+      (uint32_t)addr_range.address, (uint32_t)addr_range.size,
+   };
+   const int modo_sw = cmd->state.sw.modo_emision;
+   uint32_t *const inicio_sw = p->end;
+   if (modo_sw == NVK_SW_RAPIDO) {
+      nvk_sw_1inc_rapido(p, NV9097_CALL_MME_MACRO(NVK_MME_BIND_VB), datos_sw, 4);
+   } else
+#endif
+   {
    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_VB));
    P_INLINE_DATA(p, vb_idx);
    P_INLINE_DATA(p, addr_range.address >> 32);
    P_INLINE_DATA(p, addr_range.address);
    assert(addr_range.size <= UINT32_MAX);
    P_INLINE_DATA(p, addr_range.size);
+#ifdef HAVE_SWITCH_PLATFORM
+   if (modo_sw == NVK_SW_COMPROBAR)
+      nvk_sw_comprobar_1inc(cmd, p, inicio_sw,
+                            NV9097_CALL_MME_MACRO(NVK_MME_BIND_VB), datos_sw, 4);
+#endif
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4689,6 +5438,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
                              const VkBindVertexBuffer3InfoKHR* pBindingInfos)
 {
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_sw = nvk_sw_toca_medir(cmd, NVK_SW_T_VB) ? nvk_sw_ticks() : 0; /* NFSMW */
+#endif
 
    vk_cmd_set_vertex_binding_strides2(&cmd->vk, firstBinding,
                                        bindingCount, pBindingInfos);
@@ -4704,6 +5456,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
 
       nvk_cmd_bind_vertex_buffer(cmd, idx, addr_range);
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_parte(cmd, NVK_SW_P_ENLACE_VB, t_sw); /* NFSMW */
+#endif
 }
 
 static void
@@ -4944,15 +5699,44 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
    if (unlikely(!vertexCount || !instanceCount))
       return;
 
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_dibujo_sw = nvk_sw_empezar_dibujo(cmd); /* NFSMW */
+#endif
    nvk_cmd_flush_gfx_state(cmd);
 
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_emitir_sw = nvk_sw_t0(cmd);
+#endif
    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_EMISION, the same command written at once */
+   const uint32_t datos_sw[5] = {
+      0 /* draw_index */, vertexCount, instanceCount, firstVertex, firstInstance,
+   };
+   const int modo_sw = cmd->state.sw.modo_emision;
+   uint32_t *const inicio_sw = p->end;
+   if (modo_sw == NVK_SW_RAPIDO) {
+      nvk_sw_1inc_rapido(p, NV9097_CALL_MME_MACRO(NVK_MME_DRAW), datos_sw, 5);
+   } else
+#endif
+   {
    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW));
    P_INLINE_DATA(p, 0 /* draw_index */);
    P_INLINE_DATA(p, vertexCount);
    P_INLINE_DATA(p, instanceCount);
    P_INLINE_DATA(p, firstVertex);
    P_INLINE_DATA(p, firstInstance);
+#ifdef HAVE_SWITCH_PLATFORM
+   if (modo_sw == NVK_SW_COMPROBAR)
+      nvk_sw_comprobar_1inc(cmd, p, inicio_sw,
+                            NV9097_CALL_MME_MACRO(NVK_MME_DRAW), datos_sw, 5);
+#endif
+   }
+#ifdef HAVE_SWITCH_PLATFORM
+   cmd->state.sw.modo_emision = nvk_sw_emision_modo(cmd);
+   nvk_sw_parte(cmd, NVK_SW_P_EMITIR, t_emitir_sw);
+   nvk_sw_terminar_dibujo(cmd, t_dibujo_sw);
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -5122,9 +5906,29 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
    if (unlikely(!indexCount || !instanceCount))
       return;
 
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_dibujo_sw = nvk_sw_empezar_dibujo(cmd); /* NFSMW */
+#endif
    nvk_cmd_flush_gfx_state(cmd);
 
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_emitir_sw = nvk_sw_t0(cmd);
+#endif
    struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_EMISION, the same command written at once */
+   const uint32_t datos_sw[6] = {
+      0 /* draw_index */, indexCount, instanceCount, firstIndex,
+      (uint32_t)vertexOffset, firstInstance,
+   };
+   const int modo_sw = cmd->state.sw.modo_emision;
+   uint32_t *const inicio_sw = p->end;
+   if (modo_sw == NVK_SW_RAPIDO) {
+      nvk_sw_1inc_rapido(p, NV9097_CALL_MME_MACRO(NVK_MME_DRAW_INDEXED),
+                         datos_sw, 6);
+   } else
+#endif
+   {
    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED));
    P_INLINE_DATA(p, 0 /* draw_index */);
    P_INLINE_DATA(p, indexCount);
@@ -5132,6 +5936,18 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
    P_INLINE_DATA(p, firstIndex);
    P_INLINE_DATA(p, vertexOffset);
    P_INLINE_DATA(p, firstInstance);
+#ifdef HAVE_SWITCH_PLATFORM
+   if (modo_sw == NVK_SW_COMPROBAR)
+      nvk_sw_comprobar_1inc(cmd, p, inicio_sw,
+                            NV9097_CALL_MME_MACRO(NVK_MME_DRAW_INDEXED),
+                            datos_sw, 6);
+#endif
+   }
+#ifdef HAVE_SWITCH_PLATFORM
+   cmd->state.sw.modo_emision = nvk_sw_emision_modo(cmd);
+   nvk_sw_parte(cmd, NVK_SW_P_EMITIR, t_emitir_sw);
+   nvk_sw_terminar_dibujo(cmd, t_dibujo_sw);
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL

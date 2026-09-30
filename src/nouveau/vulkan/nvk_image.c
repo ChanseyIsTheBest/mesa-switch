@@ -2,6 +2,7 @@
  * Copyright © 2022 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include <stdio.h>   /* NFSMW: ZCULL trace */
 #include "nvk_image.h"
 
 #include "nvk_device.h"
@@ -1090,7 +1091,16 @@ nvk_image_init(struct nvk_device *dev,
       }
    }
 
-#ifndef __SWITCH__
+/* ZCULL enabled on Switch as well.
+ *
+ * This block was wrapped in #ifndef __SWITCH__ without any note justifying it. NXVK
+ * (the same NVK ported to the same console) has it enabled with this same code, so there is
+ * no known reason to turn it off. ZCULL rejects occluded pixels before shading them, which
+ * is exactly what this game needs: 13.6 M fragments per frame at ~280 operations.
+ *
+ * Note: the image is only eligible if it has no uses other than depth attachment and reads.
+ * The game's renderer had to stop requesting TRANSFER_DST on its depth render targets.
+ */
    const VkImageUsageFlagBits READ_ONLY_IMAGE_USAGE =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -1113,8 +1123,35 @@ nvk_image_init(struct nvk_device *dev,
       image->zcull.nil = nil_zcull_new(&pdev->info.zcull_info, 0, 0,
                                        image->vk.extent.width,
                                        image->vk.extent.height);
+      /* One trace line per size, to confirm from the console log that the ZCULL plane
+       * is really assigned. Without it there is no way to tell "ZCULL active" from
+       * "ZCULL silently inert", which is exactly what happened here.
+       */
+      static uint32_t avisados_zcull = 0;
+      if (avisados_zcull < 8) {
+         avisados_zcull++;
+         fprintf(stderr,
+                 "[nvk] ZCULL: plano de %u bytes para profundidad %ux%u (align %u)\n",
+                 (unsigned)image->zcull.nil.size_B,
+                 image->vk.extent.width, image->vk.extent.height,
+                 (unsigned)image->zcull.nil.align_B);
+      }
+   } else if ((image->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+              (image->vk.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+      /* Depth without a ZCULL plane. Say why: that is what takes hours to find out. */
+      static uint32_t avisados_sin_zcull = 0;
+      if (avisados_sin_zcull < 8) {
+         avisados_sin_zcull++;
+         fprintf(stderr,
+                 "[nvk] ZCULL: SIN plano para profundidad %ux%u:%s%s%s%s\n",
+                 image->vk.extent.width, image->vk.extent.height,
+                 !pdev->info.has_zcull_info ? " el driver no sabe que la GPU tiene zcull" : "",
+                 (image->vk.usage & ~ZCULL_COMPATIBLE_IMAGE_USAGE) ?
+                    " usos incompatibles (TRANSFER_DST?)" : "",
+                 (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ? " sparse" : "",
+                 image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ? " tiling no optimo" : "");
+      }
    }
-#endif
 
    const enum pipe_format plane0_format = image->planes[0].nil.format.p_format;
    if (plane0_format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {

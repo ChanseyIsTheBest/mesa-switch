@@ -1990,7 +1990,8 @@ if with_clc
   # all-targets is needed to support static linking LLVM build with multiple targets.
   # windowsdriver is needded with LLVM>=15 and frontendhlsl is needed with LLVM>=16,
   # but we don't know what LLVM version we are using yet
-  llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl', 'frontenddriver']
+  # 'demangle' is needed when linking static clang with GCC/MinGW (llvm::demangle in libclangCodeGen).
+  llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl', 'frontenddriver', 'demangle']
 endif
 if draw_with_llvm
   llvm_modules += 'native'

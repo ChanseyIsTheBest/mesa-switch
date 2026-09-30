@@ -4,6 +4,17 @@ set -e
 IMAGE_NAME="devkitpro-mesa-rust"
 CONTAINER_NAME="mesa-switch-build"
 
+# Folder mounted into the container. From an MSYS2 or Git Bash shell on Windows, Docker needs the
+# Windows path, and MSYS must not rewrite the arguments of docker.exe: it would turn "-v a:/project"
+# into a Windows path list and the '/project/...' paths inside the scripts passed to docker exec
+# into C:/... paths. From Linux, WSL or macOS nothing changes.
+PROJECT_DIR="$(pwd)"
+if [ -n "${MSYSTEM:-}" ]; then
+    PROJECT_DIR="$(pwd -W)"
+    export MSYS2_ARG_CONV_EXCL="*"   # MSYS2
+    export MSYS_NO_PATHCONV=1        # Git Bash
+fi
+
 # Build the Docker image if needed.
 if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     echo "=== Building Docker image ==="
@@ -13,7 +24,7 @@ fi
 # Start the build container.
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 docker run -d --name "$CONTAINER_NAME" \
-    -v "$(pwd):/project" --workdir "/project" \
+    -v "${PROJECT_DIR}:/project" --workdir "/project" \
     "$IMAGE_NAME" sleep infinity
 
 run() { docker exec "$CONTAINER_NAME" bash -c "$1"; }
@@ -99,7 +110,7 @@ export PATH="/usr/local/libexec:/project/builddir-native/src/compiler/clc:/proje
 cd /project && meson setup builddir-switch --wipe \
     --cross-file switch_cross_file.txt \
     --buildtype=release \
-    -Doptimization=1 \
+    -Doptimization=2 \
     -Db_lto=false \
     -Db_ndebug=true \
     -Dvulkan-drivers=nouveau \

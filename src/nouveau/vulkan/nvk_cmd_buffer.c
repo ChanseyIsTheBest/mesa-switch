@@ -18,6 +18,9 @@
 #include "nvkmd/nvkmd.h"
 
 #include "vk_pipeline_layout.h"
+#ifdef HAVE_SWITCH_PLATFORM
+#include "vk_pipeline.h" /* NFSMW: vk_switch_precarga */
+#endif
 #include "vk_synchronization.h"
 #include "util/compiler.h"
 
@@ -275,6 +278,9 @@ nvk_cmd_buffer_flush_no_prefetch_push(struct nvk_cmd_buffer *cmd)
 void
 nvk_cmd_buffer_new_push(struct nvk_cmd_buffer *cmd)
 {
+#ifdef HAVE_SWITCH_PLATFORM
+   const uint64_t t_sw = nvk_sw_ticks(); /* NFSMW: always, this path is rare */
+#endif
    nvk_cmd_buffer_flush_push(cmd, false);
 
    uint8_t subc_mask = nvk_cmd_buffer_subchannel_mask(cmd);
@@ -295,6 +301,11 @@ nvk_cmd_buffer_new_push(struct nvk_cmd_buffer *cmd)
       cmd->push_mem_limit =
          (uint32_t *)((char *)cmd->push_mem->mem->map + NVK_CMD_MEM_SIZE);
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   cmd->state.sw.cuentas[NVK_SW_C_TROZOS]++;
+   cmd->state.sw.partes[NVK_SW_P_TROZO].veces++;
+   cmd->state.sw.partes[NVK_SW_P_TROZO].ticks += nvk_sw_ticks() - t_sw;
+#endif
 }
 
 void
@@ -574,6 +585,9 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
 
    nvk_reset_cmd_buffer(&cmd->vk, 0);
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_empezar_bufer(cmd); /* NFSMW: measurement and improvements for this buffer */
+#endif
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
       cmd->state.inherited_pipeline_statistics =
@@ -623,6 +637,8 @@ nvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     * the common in-buffer case is still deferred to its first real consumer.
     */
    nvk_cmd_buffer_switch_flush_pending_mme_sync(cmd);
+   nvk_switch_set4_sumar(cmd); /* NFSMW */
+   nvk_sw_sumar(cmd); /* NFSMW */
 #endif
 
    nvk_cmd_buffer_flush_push(cmd, false);
@@ -1208,6 +1224,18 @@ nvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd,
    struct nvk_cmd_buffer *cmd = container_of(vk_cmd, struct nvk_cmd_buffer, vk);
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
 
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: vkCmdBindPipeline measurement, 1 of every N. It is decided
+    * here, the first thing binding a graphics pipeline does, and
+    * nvk_sw_cmd_set_dynamic_graphics_state, which runs right after, uses it too.
+    */
+   const bool graficos_sw = stage_count > 0 &&
+                            stages[0] != MESA_SHADER_COMPUTE &&
+                            stages[0] != MESA_SHADER_KERNEL;
+   cmd->state.sw.midiendo_pipe = graficos_sw && nvk_sw_toca_medir(cmd, NVK_SW_T_PIPE);
+   const uint64_t t_sw = cmd->state.sw.midiendo_pipe ? nvk_sw_ticks() : 0;
+#endif
+
    for (uint32_t i = 0; i < stage_count; i++) {
       struct nvk_shader *shader =
          container_of(shaders[i], struct nvk_shader, vk);
@@ -1223,9 +1251,51 @@ nvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd,
       else
          nvk_cmd_bind_graphics_shader(cmd, stages[i], shader);
    }
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_parte(cmd, NVK_SW_P_PIPE_SHADERS, t_sw); /* NFSMW */
+#endif
 }
 
 #define NVK_VK_GRAPHICS_STAGE_BITS (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)
+
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: NVK_SW_M_CBUFS. The cbuf groups of a set of stages (the
+ * usual loop), cached with their key: the stages and whether there is a task shader,
+ * which is all they depend on. When checking, it is recomputed and compared.
+ */
+static inline uint32_t
+nvk_sw_grupos_de_etapas(struct nvk_cmd_buffer *cmd, VkShaderStageFlags stages,
+                        bool usar_guardados, bool comprobar)
+{
+   const struct nvk_shader *mesh_shader =
+      cmd->state.gfx.shaders[MESA_SHADER_MESH];
+   const bool has_task_shader =
+      mesh_shader != NULL && mesh_shader->info.mesh.has_task_shader;
+   const bool guardados = usar_guardados &&
+                          cmd->state.gfx.sw_grupos_etapas == stages &&
+                          cmd->state.gfx.sw_grupos_tarea == has_task_shader;
+   if (guardados && !comprobar)
+      return cmd->state.gfx.sw_grupos;
+
+   uint32_t groups = 0;
+   u_foreach_bit(i, stages & NVK_VK_GRAPHICS_STAGE_BITS) {
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(1 << i);
+      uint32_t g = nvk_cbuf_binding_for_stage(stage, has_task_shader);
+      groups |= BITFIELD_BIT(g);
+   }
+
+   if (guardados) {
+      if (groups == cmd->state.gfx.sw_grupos)
+         cmd->state.sw.validadas[NVK_SW_M_CBUFS]++;
+      else
+         nvk_sw_diferencia(cmd, NVK_SW_M_CBUFS, "grupos de cbufs guardados");
+   }
+   cmd->state.gfx.sw_grupos_etapas = stages;
+   cmd->state.gfx.sw_grupos_tarea = has_task_shader;
+   cmd->state.gfx.sw_grupos = groups;
+   return groups;
+}
+#endif
 
 void
 nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
@@ -1235,6 +1305,18 @@ nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
    if (!(stages & NVK_VK_GRAPHICS_STAGE_BITS))
       return;
 
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: NVK_SW_M_CBUFS */
+   cmd->state.gfx.sw_cbufs_limpios = false;
+   const bool sw_cbufs = nvk_sw_activa(cmd, NVK_SW_M_CBUFS);
+   bool sw_comprobar = false;
+   if (sw_cbufs) {
+      cmd->state.sw.usos[NVK_SW_M_CBUFS]++;
+      sw_comprobar = nvk_sw_toca_comprobar(cmd, NVK_SW_M_CBUFS);
+   }
+   const uint32_t groups =
+      nvk_sw_grupos_de_etapas(cmd, stages, sw_cbufs, sw_comprobar);
+#else
    const struct nvk_shader *mesh_shader =
       cmd->state.gfx.shaders[MESA_SHADER_MESH];
    const bool has_task_shader =
@@ -1246,10 +1328,33 @@ nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
       uint32_t g = nvk_cbuf_binding_for_stage(stage, has_task_shader);
       groups |= BITFIELD_BIT(g);
    }
+#endif
 
    u_foreach_bit(g, groups) {
       struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
 
+#ifdef HAVE_SWITCH_PLATFORM
+      /* NFSMW: NVK_SW_M_CBUFS. Only the DESC_SET, UBO_DESC and
+       * DYNAMIC_UBO slots can get dirty, and those are desc_slots and
+       * dyn_ubo_slots (nvk_switch_set4_anotar_tipo keeps them up to date whenever
+       * cbufs[] changes): those are walked instead of all 16 with their switch. The
+       * guard walks all 16 as usual and compares the resulting dirty mask.
+       */
+      uint16_t sw_sucio = group->dirty;
+      if (sw_cbufs) {
+         unsigned casillas = group->desc_slots | group->dyn_ubo_slots;
+         while (casillas) {
+            const unsigned i = u_bit_scan(&casillas);
+            const struct nvk_cbuf *cbuf = &group->cbufs[i];
+            if (cbuf->desc_set >= sets_start && cbuf->desc_set < sets_end)
+               sw_sucio |= BITFIELD_BIT(i);
+         }
+         if (!sw_comprobar) {
+            group->dirty = sw_sucio;
+            continue;
+         }
+      }
+#endif
       for (uint32_t i = 0; i < ARRAY_SIZE(group->cbufs); i++) {
          const struct nvk_cbuf *cbuf = &group->cbufs[i];
          switch (cbuf->type) {
@@ -1269,8 +1374,374 @@ nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
             UNREACHABLE("Invalid cbuf type");
          }
       }
+#ifdef HAVE_SWITCH_PLATFORM
+      if (sw_cbufs && sw_comprobar) {
+         if (group->dirty == sw_sucio)
+            cmd->state.sw.validadas[NVK_SW_M_CBUFS]++;
+         else
+            nvk_sw_diferencia(cmd, NVK_SW_M_CBUFS, "casillas de cbufs a ensuciar");
+      }
+#endif
    }
 }
+
+#ifdef HAVE_SWITCH_PLATFORM
+#include "util/u_debug.h"
+
+/* NFSMW: set 4 by differences (NVK_SWITCH_DYN_UBO_DELTA,
+ * on by default).
+ *
+ * The game binds set 4 (three dynamic UBOs: VS constants, PS constants and
+ * shared ones) in 70-78 % of the draws, almost always because one of the three
+ * offsets changed. On Maxwell, without a hardware root table,
+ * each bind cost 1.3 us of CPU on the recording thread:
+ * - four flush_root, one per word of the dynamic descriptors
+ * (dynamic_buffers[k], k = 0..3), even if only the low part of the
+ * address (k = 0) changes: the high part, the size and the zero are the same;
+ * - a walk over 5 groups x 16 slots to dirty all the cbufs of the
+ * set, and on the next draw four rebinds (VS b0 and b2, FS b1 and
+ * b2) with their SELECT_CB0, even if only one changed.
+ *
+ * By differences:
+ * - only the words that change or that have not been sent yet in this command
+ * buffer (dyn_synced) go to the GPU root table, with one command per
+ * array k that covers them: almost always a single command of one to three words
+ * (the low part of the address of the offsets that change);
+ * - only the DYNAMIC_UBO cbufs whose descriptor changed value get
+ * dirtied (all of them, if the start of a set's dynamic range changes); the
+ * DESC_SET and UBO_DESC ones of the bound sets, as always; and without
+ * walking empty slots (dyn_ubo_slots and desc_slots of each group).
+ *
+ * WHY IT IS EXACT. The GPU ends up with the same root table: whatever is not sent
+ * was already sent in this command buffer with that same value (between two points of
+ * a buffer, cb0 is only changed by the buffer itself, and dynamic_buffers is only
+ * written by nvk_bind_descriptor_sets). And every cbuf ends up bound to the same thing: a
+ * cbuf that is not dirty keeps what was bound in its last flush, which came from
+ * root; if since then no bind has changed the value of its descriptor,
+ * root still says the same. Dirty bits are not cleared until the next flush,
+ * so a change that is later reverted also rebinds. Changing
+ * shaders dirties on its own the slots whose map changes
+ * (nvk_cmd_flush_gfx_shaders), as always.
+ *
+ * SELF-CHECKING GUARD (nvk_switch_set4_comprobar, nvk_cmd_draw.c):
+ * in the first 200,000 draws of the process and then in 1 of every 4,096 of
+ * each command buffer, every DYNAMIC_UBO cbuf about to be used without a rebind
+ * is compared with what was really bound in that slot. On a
+ * difference: that slot and all DYNAMIC_UBO ones are rebound (the draw comes out
+ * right), DIFERENCIA on stderr and off for the rest of the session (apagado =
+ * 1, which the app forwards to its log with REXLOG_ERROR).
+ *
+ * The app (nfsmw_nativo_dibujos.cpp, cvar nfsmw_nativo_set4_diferencias) requests
+ * or withdraws it on every submit through pedido, and reads total for its C6 set 4 line.
+ * NVK_SWITCH_DYN_UBO_DELTA=false (in nfsmw_mesa_entorno) turns it off from outside.
+ */
+struct nvk_switch_set4 nvk_switch_set4 = {
+   .version = 1,
+   .pedido = -1,
+   .entorno = -1,
+   .apagado = 0,
+};
+
+DEBUG_GET_ONCE_BOOL_OPTION(nvk_switch_dyn_ubo_delta, "NVK_SWITCH_DYN_UBO_DELTA", true)
+
+int32_t
+nvk_switch_set4_leer_entorno(void)
+{
+   const int32_t entorno = debug_get_option_nvk_switch_dyn_ubo_delta() ? 1 : 0;
+   if (p_atomic_xchg(&nvk_switch_set4.entorno, entorno) < 0) {
+      fprintf(stderr, "[nvk] set 4 por diferencias (NFSMW, build 184): %s\n",
+              entorno ? "disponible (NVK_SWITCH_DYN_UBO_DELTA)"
+                      : "apagado por NVK_SWITCH_DYN_UBO_DELTA");
+   }
+   return entorno;
+}
+
+void
+nvk_switch_set4_sumar(struct nvk_cmd_buffer *cmd)
+{
+   struct nvk_switch_set4_cuentas *c = &cmd->state.set4;
+   struct nvk_switch_set4_cuentas *t = &nvk_switch_set4.total;
+
+   if (c->enlaces_diferencia)
+      p_atomic_add(&t->enlaces_diferencia, c->enlaces_diferencia);
+   if (c->enlaces_completos)
+      p_atomic_add(&t->enlaces_completos, c->enlaces_completos);
+   if (c->escrituras_raiz)
+      p_atomic_add(&t->escrituras_raiz, c->escrituras_raiz);
+   if (c->dwords_raiz)
+      p_atomic_add(&t->dwords_raiz, c->dwords_raiz);
+   if (c->cbufs_sucios)
+      p_atomic_add(&t->cbufs_sucios, c->cbufs_sucios);
+   if (c->cbufs_ahorrados)
+      p_atomic_add(&t->cbufs_ahorrados, c->cbufs_ahorrados);
+   if (c->dibujos)
+      p_atomic_add(&t->dibujos, c->dibujos);
+   if (c->comprobaciones)
+      p_atomic_add(&t->comprobaciones, c->comprobaciones);
+   if (c->diferencias)
+      p_atomic_add(&t->diferencias, c->diferencias);
+   memset(c, 0, sizeof(*c));
+}
+
+/* Sends to the root table only the words dynamic_buffers[k][d], with d from
+ * inicio to fin - 1, that change or have not been sent yet in this command
+ * buffer, with one command per array k that covers them. Returns in *cambiados
+ * the descriptors whose value changed (so that only their cbufs get dirtied).
+ */
+static void
+nvk_switch_set4_escribir_raiz(struct nvk_cmd_buffer *cmd,
+                              struct nvk_descriptor_state *desc,
+                              uint32_t dynamic_buffers[4][NVK_MAX_DYNAMIC_BUFFERS],
+                              uint32_t inicio, uint32_t fin,
+                              uint64_t *cambiados)
+{
+   const struct nvk_root_descriptor_table *raiz =
+      (const struct nvk_root_descriptor_table *)desc->root;
+   uint64_t distintos = 0;
+
+   for (uint32_t k = 0; k < 4; k++) {
+      uint32_t primero = fin, ultimo = inicio;
+      for (uint32_t d = inicio; d < fin; d++) {
+         const bool distinto =
+            raiz->dynamic_buffers[k][d] != dynamic_buffers[k][d];
+         if (distinto)
+            distintos |= BITFIELD64_BIT(d);
+         if (distinto || !(desc->dyn_synced & BITFIELD64_BIT(d))) {
+            if (primero == fin)
+               primero = d;
+            ultimo = d;
+         }
+      }
+      if (primero < fin) {
+         const uint32_t n = ultimo - primero + 1;
+         nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers[k],
+                                             primero, n,
+                                             &dynamic_buffers[k][primero]);
+         cmd->state.set4.escrituras_raiz++;
+         cmd->state.set4.dwords_raiz += n;
+      }
+   }
+   if (fin > inicio) {
+      desc->dyn_synced |= BITFIELD64_RANGE(inicio, fin - inicio);
+      cmd->state.set4.enlaces_diferencia++;
+   }
+   *cambiados = distintos;
+}
+
+/* The usual path, as is, recording that what was sent is up to date. */
+static void
+nvk_switch_set4_escribir_raiz_completa(struct nvk_cmd_buffer *cmd,
+                                       struct nvk_descriptor_state *desc,
+                                       uint32_t dynamic_buffers[4][NVK_MAX_DYNAMIC_BUFFERS],
+                                       uint32_t inicio, uint32_t fin)
+{
+   for (int i = 0; i < 4; i++)
+      nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers[i],
+                                          inicio, fin - inicio,
+                                          &dynamic_buffers[i][inicio]);
+   if (desc->flush_root != NULL && fin > inicio)
+      desc->dyn_synced |= BITFIELD64_RANGE(inicio, fin - inicio);
+   if (desc == &cmd->state.gfx.descriptors && fin > inicio)
+      cmd->state.set4.enlaces_completos++;
+}
+
+/* Like nvk_cmd_dirty_cbufs_for_descriptors, but the DYNAMIC_UBO cbufs are only
+ * dirtied if the descriptor they read changed value. The DESC_SET and
+ * UBO_DESC ones of the bound sets are always dirtied, as before.
+ */
+static void
+nvk_switch_set4_ensuciar(struct nvk_cmd_buffer *cmd,
+                         VkShaderStageFlags stages,
+                         uint32_t sets_start, uint32_t sets_end,
+                         const uint8_t *inicio_dinamico,
+                         uint64_t cambiados)
+{
+   if (!(stages & NVK_VK_GRAPHICS_STAGE_BITS))
+      return;
+
+   /* NFSMW: NVK_SW_M_CBUFS: something gets dirtied, and the cached groups of
+    * these stages (nvk_sw_grupos_de_etapas)
+    */
+   cmd->state.gfx.sw_cbufs_limpios = false;
+   const bool sw_cbufs = nvk_sw_activa(cmd, NVK_SW_M_CBUFS);
+   bool sw_comprobar = false;
+   if (sw_cbufs) {
+      cmd->state.sw.usos[NVK_SW_M_CBUFS]++;
+      sw_comprobar = nvk_sw_toca_comprobar(cmd, NVK_SW_M_CBUFS);
+   }
+   const uint32_t groups =
+      nvk_sw_grupos_de_etapas(cmd, stages, sw_cbufs, sw_comprobar);
+
+   u_foreach_bit(g, groups) {
+      struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
+
+      unsigned conjuntos = group->desc_slots;
+      while (conjuntos) {
+         const unsigned i = u_bit_scan(&conjuntos);
+         const struct nvk_cbuf *cbuf = &group->cbufs[i];
+         if (cbuf->desc_set >= sets_start && cbuf->desc_set < sets_end)
+            group->dirty |= BITFIELD_BIT(i);
+      }
+
+      unsigned dinamicos = group->dyn_ubo_slots;
+      while (dinamicos) {
+         const unsigned i = u_bit_scan(&dinamicos);
+         const struct nvk_cbuf *cbuf = &group->cbufs[i];
+         if (cbuf->desc_set < sets_start || cbuf->desc_set >= sets_end)
+            continue;
+
+         const uint32_t d = inicio_dinamico[cbuf->desc_set] + cbuf->dynamic_idx;
+         if (d >= NVK_MAX_DYNAMIC_BUFFERS || (cambiados & BITFIELD64_BIT(d))) {
+            group->dirty |= BITFIELD_BIT(i);
+            cmd->state.set4.cbufs_sucios++;
+         } else {
+            cmd->state.set4.cbufs_ahorrados++;
+         }
+      }
+   }
+}
+#endif
+
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: per-part measurement of the draw and exact improvements
+ * (nvk_switch_dibujo, NVK_SWITCH_DIBUJO).
+ *
+ * The thread that records the draws spends about 3.4 us per draw inside NVK in
+ * a race ("C6 subetapas" line: Draw 1.4-2.0 us; BindPipeline 3.2-4.4 us
+ * in 25-27 % of the draws; set 4 1.2-1.5 us in 64-72 %). That is about
+ * 6.5 ms per frame on the game's bottleneck. Before optimizing blindly, it is
+ * measured inside NVK:
+ *
+ * - partes: CNTPCT_EL0 ticks (19.2 MHz: 52 ns per tick; with thousands of
+ * samples the average is unbiased) of each piece of vkCmdDraw*,
+ * vkCmdBindPipeline and vkCmdBindDescriptorSets, 1 of every N calls (the app
+ * sets N in medir; 0 = not measured and the cost is one branch per call);
+ * - cuentas: dirty dynamic bits per draw, dirty shaders, rebound
+ * cbufs, dwords per draw, pipeline state copies that changed
+ * nothing, root table uploads and new pushbuf chunks;
+ * - medir_fallos: in the measured ones, before the pipeline copy and the shader
+ * flush all their data is read and that time is counted apart (the TOQUE parts).
+ *
+ * The improvements p02..p06 also use this structure: each has its pedido
+ * (the app), its apagado (its guard) and its counts. They are all exact: they leave
+ * the same commands with the same data in the pushbuf. Each has a
+ * self-checking guard (the first NVK_SW_A_COMPROBAR uses of the
+ * process and then 1 of every NVK_SW_CADA): it takes the usual path,
+ * compares it with the new one and, if they differ, keeps the usual one, reports it on
+ * stderr and turns that improvement off for the rest of the session.
+ */
+struct nvk_switch_dibujo nvk_switch_dibujo = {
+   .version = 1,
+   .medir = 0,
+   .medir_fallos = 0,
+   .entorno = -1,
+   .mejoras = {
+      [NVK_SW_M_EMISION] = { .pedido = -1 },
+      [NVK_SW_M_CBUFS] = { .pedido = -1 },
+      [NVK_SW_M_DINAMICO] = { .pedido = -1 },
+      [NVK_SW_M_SET4_RAPIDO] = { .pedido = -1 },
+      [NVK_SW_M_PRECARGA] = { .pedido = -1 },
+   },
+};
+
+DEBUG_GET_ONCE_BOOL_OPTION(nvk_switch_dibujo, "NVK_SWITCH_DIBUJO", true)
+
+static int32_t
+nvk_sw_leer_entorno(void)
+{
+   const int32_t entorno = debug_get_option_nvk_switch_dibujo() ? 1 : 0;
+   uint64_t frecuencia = 0;
+#if defined(__aarch64__)
+   __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frecuencia));
+#endif
+   p_atomic_set(&nvk_switch_dibujo.ticks_por_segundo, frecuencia);
+   if (p_atomic_xchg(&nvk_switch_dibujo.entorno, entorno) < 0) {
+      fprintf(stderr, "[nvk] c186 medida por partes y mejoras del dibujo: %s "
+              "(reloj %llu Hz)\n",
+              entorno ? "disponibles (NVK_SWITCH_DIBUJO)"
+                      : "apagadas por NVK_SWITCH_DIBUJO",
+              (unsigned long long)frecuencia);
+   }
+   return entorno;
+}
+
+/* In vkBeginCommandBuffer, after the reset memset: what is measured and which
+ * improvements take the new path in this buffer. Whatever the app changes afterwards
+ * applies to the next buffer.
+ */
+void
+nvk_sw_empezar_bufer(struct nvk_cmd_buffer *cmd)
+{
+   struct nvk_sw_cmd *sw = &cmd->state.sw;
+   int32_t entorno = p_atomic_read_relaxed(&nvk_switch_dibujo.entorno);
+   if (unlikely(entorno < 0))
+      entorno = nvk_sw_leer_entorno();
+
+   const int32_t medir = p_atomic_read_relaxed(&nvk_switch_dibujo.medir);
+   sw->mascara_medir =
+      (entorno > 0 && medir > 0 && util_is_power_of_two_nonzero((unsigned)medir))
+         ? (uint32_t)medir - 1 : UINT32_MAX;
+   sw->medir_fallos = sw->mascara_medir != UINT32_MAX &&
+                      p_atomic_read_relaxed(&nvk_switch_dibujo.medir_fallos) > 0;
+   sw->activas = 0;
+   if (entorno > 0) {
+      for (uint32_t m = 0; m < NVK_SW_MEJORAS; m++) {
+         const struct nvk_sw_mejora_estado *e = &nvk_switch_dibujo.mejoras[m];
+         if (p_atomic_read_relaxed(&e->pedido) != 0 &&
+             p_atomic_read_relaxed(&e->apagado) == 0)
+            sw->activas |= 1u << m;
+      }
+   }
+   /* p06: the runtime's prefetch when binding pipelines goes with NVK's */
+   p_atomic_set(&vk_switch_precarga,
+                (int32_t)((sw->activas >> NVK_SW_M_PRECARGA) & 1));
+}
+
+static void
+nvk_sw_sumar_u64(uint64_t *total, uint64_t *local)
+{
+   if (*local != 0) {
+      p_atomic_add(total, *local);
+      *local = 0;
+   }
+}
+
+void
+nvk_sw_sumar(struct nvk_cmd_buffer *cmd)
+{
+   struct nvk_sw_cmd *sw = &cmd->state.sw;
+   for (uint32_t i = 0; i < NVK_SW_PARTES; i++) {
+      nvk_sw_sumar_u64(&nvk_switch_dibujo.partes[i].veces, &sw->partes[i].veces);
+      nvk_sw_sumar_u64(&nvk_switch_dibujo.partes[i].ticks, &sw->partes[i].ticks);
+   }
+   for (uint32_t i = 0; i < NVK_SW_CUENTAS; i++)
+      nvk_sw_sumar_u64(&nvk_switch_dibujo.cuentas[i], &sw->cuentas[i]);
+   for (uint32_t m = 0; m < NVK_SW_MEJORAS; m++) {
+      struct nvk_sw_mejora_estado *e = &nvk_switch_dibujo.mejoras[m];
+      nvk_sw_sumar_u64(&e->usos, &sw->usos[m]);
+      nvk_sw_sumar_u64(&e->validadas, &sw->validadas[m]);
+      nvk_sw_sumar_u64(&e->diferencias, &sw->diferencias[m]);
+      nvk_sw_sumar_u64(&e->sin_comprobar, &sw->sin_comprobar[m]);
+   }
+}
+
+/* The guard of improvement m saw a difference. The caller has already kept
+ * the result of the usual path. It is turned off for the session (the
+ * following buffers do not enable it; this one stops using it right away).
+ */
+void
+nvk_sw_diferencia(struct nvk_cmd_buffer *cmd, enum nvk_sw_mejora m,
+                  const char *que)
+{
+   cmd->state.sw.diferencias[m]++;
+   cmd->state.sw.activas &= ~(1u << m);
+   if (p_atomic_xchg(&nvk_switch_dibujo.mejoras[m].apagado, 1) == 0) {
+      fprintf(stderr, "[nvk] c186: DIFERENCIA en la mejora %u (%s): este caso "
+              "sale por el camino de siempre y la mejora se apaga para el resto "
+              "de la sesion\n", (unsigned)m, que);
+   }
+}
+#endif
 
 static void
 nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
@@ -1309,6 +1780,9 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
    uint8_t dyn_buffer_end = dyn_buffer_start;
 
+#ifdef HAVE_SWITCH_PLATFORM
+   bool inicio_dinamico_cambiado = false; /* NFSMW */
+#endif
    uint32_t next_dyn_offset = 0;
    for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
       unsigned s = i + info->firstSet;
@@ -1329,6 +1803,14 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
          nvk_descriptor_state_set_root(cmd, desc, sets[s], set_addr);
       }
 
+#ifdef HAVE_SWITCH_PLATFORM
+      /* NFSMW: if the start of a set's dynamic range changes, its
+       * DYNAMIC_UBO cbufs read another descriptor: they are all
+       * dirtied, as always.
+       */
+      if (set_dynamic_buffer_start[s] != dyn_buffer_end)
+         inicio_dinamico_cambiado = true;
+#endif
       set_dynamic_buffer_start[s] = dyn_buffer_end;
 
       if (pipeline_layout->set_layouts[s] != NULL) {
@@ -1364,21 +1846,67 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
    assert(dyn_buffer_end <= NVK_MAX_DYNAMIC_BUFFERS);
    assert(next_dyn_offset <= info->dynamicOffsetCount);
 
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: measurement of the root table part */
+   uint64_t t_sw = unlikely(cmd->state.sw.midiendo_sets) ? nvk_sw_ticks() : 0;
+   /* NFSMW: set 4 by differences (see nvk_switch_set4). */
+   const bool por_diferencias = desc == &cmd->state.gfx.descriptors &&
+                                desc->flush_root != NULL &&
+                                !nvk_use_hw_root_table(&pdev->info, true) &&
+                                nvk_switch_set4_activo();
+   uint64_t dinamicos_cambiados = 0;
+   if (por_diferencias) {
+      nvk_switch_set4_escribir_raiz(cmd, desc, dynamic_buffers,
+                                    dyn_buffer_start, dyn_buffer_end,
+                                    &dinamicos_cambiados);
+   } else {
+      nvk_switch_set4_escribir_raiz_completa(cmd, desc, dynamic_buffers,
+                                             dyn_buffer_start, dyn_buffer_end);
+   }
+#else
    for (int i = 0; i < 4; i++)
       nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers[i],
                                           dyn_buffer_start, dyn_buffer_end - dyn_buffer_start,
                                           &dynamic_buffers[i][dyn_buffer_start]);
+#endif
 
    /* We need to at least sync everything from first_set to NVK_MAX_SETS.
     * However, we only save anything if firstSet >= 4 so we may as well sync
     * everything just to be safe.
     */
-   nvk_descriptor_state_set_root_array(cmd, desc, set_dynamic_buffer_start,
-                                       0, NVK_MAX_SETS,
-                                       set_dynamic_buffer_start);
+   /* NFSMW: without a hardware root table (Maxwell) each upload of this
+    * is 10 dwords in the pushbuf, and the game binds set 4 in 70 %
+    * of the draws without anything changing here. It is skipped only if it was already
+    * sent in this same command buffer (the CPU copy matches the GPU's).
+    */
+   {
+      const struct nvk_root_descriptor_table *root_actual =
+         (const struct nvk_root_descriptor_table *)desc->root;
+      if (desc->flush_root == NULL || !desc->dyn_start_synced ||
+          memcmp(root_actual->set_dynamic_buffer_start, set_dynamic_buffer_start,
+                 sizeof(set_dynamic_buffer_start)) != 0) {
+         nvk_descriptor_state_set_root_array(cmd, desc, set_dynamic_buffer_start,
+                                             0, NVK_MAX_SETS,
+                                             set_dynamic_buffer_start);
+         desc->dyn_start_synced = desc->flush_root != NULL;
+      }
+   }
 
+#ifdef HAVE_SWITCH_PLATFORM
+   t_sw = nvk_sw_parte(cmd, NVK_SW_P_SETS_RAIZ, t_sw); /* NFSMW */
+   if (por_diferencias && !inicio_dinamico_cambiado) {
+      nvk_switch_set4_ensuciar(cmd, info->stageFlags, info->firstSet,
+                               info->firstSet + info->descriptorSetCount,
+                               set_dynamic_buffer_start, dinamicos_cambiados);
+      nvk_sw_parte(cmd, NVK_SW_P_SETS_ENSUCIAR, t_sw); /* NFSMW */
+      return;
+   }
+#endif
    nvk_cmd_dirty_cbufs_for_descriptors(cmd, info->stageFlags, info->firstSet,
                                        info->firstSet + info->descriptorSetCount);
+#ifdef HAVE_SWITCH_PLATFORM
+   nvk_sw_parte(cmd, NVK_SW_P_SETS_ENSUCIAR, t_sw); /* NFSMW */
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1388,6 +1916,18 @@ nvk_CmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
 
    if (pBindDescriptorSetsInfo->stageFlags & NVK_VK_GRAPHICS_STAGE_BITS) {
+#ifdef HAVE_SWITCH_PLATFORM
+      /* NFSMW: per-part measurement, 1 of every N */
+      if (unlikely(nvk_sw_toca_medir(cmd, NVK_SW_T_SETS))) {
+         cmd->state.sw.midiendo_sets = true;
+         const uint64_t t_sw = nvk_sw_ticks();
+         nvk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
+                                  pBindDescriptorSetsInfo);
+         nvk_sw_parte(cmd, NVK_SW_P_SETS, t_sw);
+         cmd->state.sw.midiendo_sets = false;
+         cmd->state.sw.cuentas[NVK_SW_C_SETS_MEDIDOS]++;
+      } else
+#endif
       nvk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
                                pBindDescriptorSetsInfo);
    }
@@ -1595,8 +2135,18 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
    VkResult result;
 
    u_foreach_bit(set_idx, desc->push_dirty) {
-      if (desc->sets[set_idx].type != NVK_DESCRIPTOR_SET_TYPE_PUSH)
+      if (desc->sets[set_idx].type != NVK_DESCRIPTOR_SET_TYPE_PUSH) {
+#ifdef HAVE_SWITCH_PLATFORM
+         /* NFSMW: NVK_SW_M_CBUFS. A set that is no longer a push descriptor set
+          * is not uploaded in any flush until it becomes one again, and then its
+          * bit is set again (nvk_cmd_push_descriptors
+          * and nvk_meta_end_gfx): it is cleared so that it is not walked on every draw.
+          */
+         if (nvk_sw_activa(cmd, NVK_SW_M_CBUFS))
+            desc->push_dirty &= ~BITFIELD_BIT(set_idx);
+#endif
          continue;
+      }
 
       struct nvk_push_descriptor_set *push_set = desc->sets[set_idx].push;
       uint32_t upload_size_B = align(push_set->size_B, min_cbuf_alignment);

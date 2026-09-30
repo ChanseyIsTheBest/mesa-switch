@@ -198,6 +198,17 @@ struct vk_pipeline_ops {
                                    mesa_shader_stage stage);
 };
 
+#ifdef HAVE_SWITCH_PLATFORM
+/* NFSMW: pipeline prefetch (NVK's NVK_SW_M_PRECARGA).
+ * NVK sets vk_switch_precarga on every vkBeginCommandBuffer (1 = request the
+ * pipeline's cache lines when its bind starts). vk_switch_precargar_pipeline
+ * requests right away the lines vkCmdBindPipeline will read; the app calls it as soon
+ * as it knows which pipeline it is about to bind. PRFM only: it changes nothing.
+ */
+extern int32_t vk_switch_precarga;
+void vk_switch_precargar_pipeline(VkPipeline pipeline);
+#endif
+
 void *vk_pipeline_zalloc(struct vk_device *device,
                          const struct vk_pipeline_ops *ops,
                          VkPipelineBindPoint bind_point,

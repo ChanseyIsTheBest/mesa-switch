@@ -459,10 +459,41 @@ nvkmd_switch_try_create_pdev(struct vk_object_base *log_obj,
    pdev->base.ops = &nvkmd_switch_pdev_ops;
    pdev->base.debug_flags = debug_flags;
 
-   /* Use static GM20B properties without acquiring libnx services during
-    * enumeration.
+   /* Use static GM20B properties; the only thing we must ask the kernel for is
+    * the ZCULL geometry, and we do that below behind a short-lived runtime
+    * reference.
     */
    nouveau_horizon_get_gm20b_info(&pdev->base.dev_info);
+
+   /* Without this, ZCULL is dead on the Vulkan path.
+    *
+    * Only the kernel knows the ZCULL geometry, and this is the last chance to publish it:
+    * nvk_create_physical_device_from_nvkmd() copies dev_info to nvk_physical_device::info right
+    * after we return (nvk_physical_device.c:1609, from nvk_instance.c:111), and that copy is
+    * what nvk_image.c (to assign the plane) and nvk_cmd_draw.c (to use it) read.
+    *
+    * The runtime reference is held only during the query: the data is copied by value, so
+    * nothing is left dangling when it is released. Failure is not fatal: the driver carries on
+    * without hierarchical depth culling.
+    */
+   struct nouveau_horizon_runtime *zcull_runtime = NULL;
+   if (nouveau_horizon_runtime_get(&zcull_runtime) == NOUVEAU_HORIZON_SUCCESS) {
+      nouveau_horizon_add_zcull_info(&pdev->base.dev_info);
+      nouveau_horizon_runtime_put(zcull_runtime);
+   }
+
+   if (pdev->base.dev_info.has_zcull_info) {
+      vk_logi(VK_LOG_OBJS(log_obj),
+              "nvkmd-switch: ZCULL activado (aliquots=%u subregiones=%u ctxsw=%u B align=%ux%u)",
+              pdev->base.dev_info.zcull_info.aliquot_total,
+              pdev->base.dev_info.zcull_info.subregion_count,
+              pdev->base.dev_info.zcull_info.ctxsw_size,
+              pdev->base.dev_info.zcull_info.subregion_width_align_pixels,
+              pdev->base.dev_info.zcull_info.subregion_height_align_pixels);
+   } else {
+      vk_logi(VK_LOG_OBJS(log_obj),
+              "nvkmd-switch: el kernel no da geometria de ZCULL; sin descarte jerarquico");
+   }
 
    pdev->base.kmd_info = (struct nvkmd_info) {
       .has_dma_buf = false,

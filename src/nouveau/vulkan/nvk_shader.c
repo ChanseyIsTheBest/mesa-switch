@@ -2,6 +2,7 @@
  * Copyright © 2022 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include <stdlib.h>   /* getenv, strtoul: NVK_SUBTILING_KNOB */
 #include "nvk_shader.h"
 
 #include "nvk_cmd_buffer.h"
@@ -20,6 +21,8 @@
 #include "vk_ycbcr_conversion.h"
 
 #include "nak.h"
+#include "util/log.h"
+#include "util/u_debug.h"
 #include "nir.h"
 #include "nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -83,6 +86,10 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
       | (use_edb_buffer_views ? 1 << 13 : 0)
       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
       | (UINT64_C(9) << 16) /* Compiler ABI revision. */
+      /* NFSMW: revision of our NAK fixes. It is hashed into the pipeline cache UUID and the disk cache
+       * keys, and on Horizon the build id is the package version, so without it the old (miscompiled) shaders
+       * would be reused. 1 = SM50 FADD32I dropped .SAT. Bump it with every NAK fix. */
+      | (UINT64_C(1) << 24)
       | (nak_flags << 48);
 }
 
@@ -175,6 +182,70 @@ nvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    }
 }
 
+/* Color attachments that really exist in the pipeline. Without state (shader objects or pipeline
+ * libraries) all of them are returned, which is the conservative choice.
+ */
+static uint32_t
+nvk_color_rt_mask(const struct vk_graphics_pipeline_state *state)
+{
+   if (state == NULL || state->rp == NULL)
+      return ~0u;
+
+   uint32_t mask = 0;
+   for (uint32_t i = 0; i < state->rp->color_attachment_count; i++) {
+      if (state->rp->color_attachment_formats[i] != VK_FORMAT_UNDEFINED)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
+}
+
+/* Writes to a nonexistent color attachment: Vulkan discards them, so they can be removed here,
+ * letting DCE remove everything that only fed that color. Whatever decides the alpha test
+ * (the alpha and its discard) does not depend on these writes and stays.
+ */
+static bool
+nvk_quitar_color_muerto_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const uint32_t rt_mask = *(const uint32_t *)data;
+
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (deref == NULL)
+      return false;
+
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (var == NULL || var->data.mode != nir_var_shader_out)
+      return false;
+
+   /* Only SV_Target0..7 with index 0: gl_FragColor (which goes to all) and the second blend source stay. */
+   if (var->data.location < FRAG_RESULT_DATA0 || var->data.index != 0)
+      return false;
+
+   const unsigned rt = var->data.location - FRAG_RESULT_DATA0;
+   if (rt >= 32 || (rt_mask & BITFIELD_BIT(rt)))
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static void
+nvk_quitar_color_muerto(nir_shader *nir, uint32_t rt_mask)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT || rt_mask == ~0u)
+      return;
+
+   bool progress = false;
+   NIR_PASS(progress, nir, nir_shader_intrinsics_pass, nvk_quitar_color_muerto_instr,
+            nir_metadata_control_flow, &rt_mask);
+   if (progress) {
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+}
+
 static void
 nvk_populate_fs_key(struct nak_fs_key *key,
                     const struct vk_graphics_pipeline_state *state)
@@ -235,6 +306,10 @@ nvk_hash_state(struct vk_physical_device *device,
       struct nak_fs_key key;
       nvk_populate_fs_key(&key, state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+
+      /* The binary depends on which color attachments exist (nvk_quitar_color_muerto). */
+      const uint32_t rt_mask = nvk_color_rt_mask(state);
+      _mesa_blake3_update(&blake3_ctx, &rt_mask, sizeof(rt_mask));
 
       /* This doesn't impact the shader compile but it does go in the
        * nvk_shader and gets [de]serialized along with the binary so we
@@ -570,6 +645,22 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
       return vk_errorf(pdev, VK_ERROR_UNKNOWN, "Internal compiler error in NAK");
 
    shader->info = shader->nak->info;
+   /* Registers, spills and occupancy of each shader (NVK_SHADER_STATS=1). On GM20B occupancy is set
+    * by the registers, and a spill to local memory is very expensive with 21 GB/s shared.
+    */
+   {
+      static int nvk_shader_stats = -1;
+      if (nvk_shader_stats < 0)
+         nvk_shader_stats = debug_get_bool_option("NVK_SHADER_STATS", false);
+      if (nvk_shader_stats) {
+         mesa_logi("estadisticas de shader: etapa %u, %u registros, %u B de memoria local, "
+                   "%u warps por SM, %u B de codigo",
+                   (unsigned)nir->info.stage, (unsigned)shader->info.num_gprs,
+                   (unsigned)shader->info.slm_size,
+                   nak_max_warps_per_sm(shader->info.num_gprs, pdev->nak),
+                   (unsigned)shader->nak->code_size);
+      }
+   }
    shader->asm_str = shader->nak->asm_str;
    shader->code_ptr = shader->nak->code;
    shader->code_size = shader->nak->code_size;
@@ -940,22 +1031,26 @@ nvk_shader_fill_push(struct nvk_device *dev,
    } else if (shader->info.stage == MESA_SHADER_FRAGMENT) {
       max_dw_count += 13;
 
+      /* NVK_SUBTILING_KNOB allows sweeping this split without recompiling. Packed as in
+       * NXVK: bits 0-7 register file, 8-15 pixel output, 16-23 triangle RAM,
+       * 24-31 maximum quads. Known values (NXVK's switch/smoke/nvk_subtile.c):
+       * 0x087f6080  deko3d, fragment default on T210  <- ours
+       * 0x20806080  deko3d, with three or more color outputs
+       * 0x20164010  generic (discrete parts and nouveau nvc0)
+       */
+      const uint32_t knob_defecto =
+         native_t210_subtiling ? 0x087f6080u : 0x20164010u;
+      const char *knob_env = getenv("NVK_SUBTILING_KNOB");
+      const uint32_t knob =
+         knob_env != NULL ? (uint32_t)strtoul(knob_env, NULL, 0) : knob_defecto;
+
       P_MTHD(p, NVC397, SET_SUBTILING_PERF_KNOB_A);
-      if (native_t210_subtiling) {
-         P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
-            .fraction_of_spm_register_file_per_subtile       = 0x80,
-            .fraction_of_spm_pixel_output_buffer_per_subtile = 0x60,
-            .fraction_of_spm_triangle_ram_per_subtile        = 0x7f,
-            .fraction_of_max_quads_per_subtile               = 0x08,
-         });
-      } else {
-         P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
-            .fraction_of_spm_register_file_per_subtile       = 0x10,
-            .fraction_of_spm_pixel_output_buffer_per_subtile = 0x40,
-            .fraction_of_spm_triangle_ram_per_subtile        = 0x16,
-            .fraction_of_max_quads_per_subtile               = 0x20,
-         });
-      }
+      P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
+         .fraction_of_spm_register_file_per_subtile       = knob & 0xff,
+         .fraction_of_spm_pixel_output_buffer_per_subtile = (knob >> 8) & 0xff,
+         .fraction_of_spm_triangle_ram_per_subtile        = (knob >> 16) & 0xff,
+         .fraction_of_max_quads_per_subtile               = (knob >> 24) & 0xff,
+      });
       P_NV9097_SET_SUBTILING_PERF_KNOB_B(p, 0x20);
 
       P_IMMD(p, NV9097, SET_API_MANDATED_EARLY_Z,
@@ -1194,6 +1289,7 @@ nvk_compile_shader(struct nvk_device *dev,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       nvk_populate_fs_key(&fs_key_tmp, state);
       fs_key = &fs_key_tmp;
+      nvk_quitar_color_muerto(nir, nvk_color_rt_mask(state));  /* NFSMW */
    }
 
    result = nvk_compile_nir(dev, nir, info->flags, info->robustness,
@@ -1630,6 +1726,11 @@ const struct vk_device_shader_ops nvk_device_shader_ops = {
    .hash_state = nvk_hash_state,
    .compile = nvk_compile_shaders,
    .deserialize = nvk_deserialize_shader,
+#ifdef HAVE_SWITCH_PLATFORM
+   /* NFSMW: the same copy; 1 of every N is measured (nvk_cmd_draw.c) */
+   .cmd_set_dynamic_graphics_state = nvk_sw_cmd_set_dynamic_graphics_state,
+#else
    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
+#endif
    .cmd_bind_shaders = nvk_cmd_bind_shaders,
 };
