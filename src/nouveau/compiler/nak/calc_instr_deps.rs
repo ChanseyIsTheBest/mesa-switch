@@ -1059,6 +1059,115 @@ fn calc_delays(f: &mut Function, sm: &ShaderModelInfo) -> u64 {
     min_num_static_cycles
 }
 
+/// The register a source reads, if it is a single 32-bit GPR (RZ, immediates and
+/// constant-buffer operands have nothing to reuse).
+fn sm50_reuse_reg(src: &Src) -> Option<RegRef> {
+    match &src.src_ref {
+        SrcRef::Reg(reg) if reg.file() == RegFile::GPR && reg.comps() == 1 => {
+            Some(*reg)
+        }
+        _ => None,
+    }
+}
+
+/// The register operand in each of the hardware operand slots A, B and C, for the
+/// instructions handled here, exactly as sm50.rs encodes them:
+/// - FADD, FMUL, and (unless NAK_DEBUG=reusebasic) FMNMX, FSET, FSETP and SEL:
+///   src0 in A (bits 8..16); src1 in B (bits 20..28) in the register form, while
+///   the immediate and constant-buffer forms have no register in B. The other
+///   fields of the last four (a predicate in 39..42, the comparison) are no
+///   register operands.
+/// - FFMA: src0 in A; with src2 a register, src1 in B (register form only) and
+///   src2 in C (bits 39..47); with src2 in the constant buffer, src1 moves to C.
+fn sm50_reuse_slots(op: &Op) -> [Option<RegRef>; 3] {
+    let two_srcs = |srcs: &[Src; 2]| -> [Option<RegRef>; 3] {
+        [sm50_reuse_reg(&srcs[0]), sm50_reuse_reg(&srcs[1]), None]
+    };
+
+    match op {
+        Op::FAdd(op) => two_srcs(&op.srcs),
+        Op::FMul(op) => two_srcs(&op.srcs),
+        Op::FMnMx(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
+        Op::FSet(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
+        Op::FSetP(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
+        Op::Sel(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
+        Op::FFma(op) => {
+            let a = sm50_reuse_reg(&op.srcs[0]);
+            match &op.srcs[2].src_ref {
+                SrcRef::CBuf(_) => [a, None, sm50_reuse_reg(&op.srcs[1])],
+                _ => [
+                    a,
+                    sm50_reuse_reg(&op.srcs[1]),
+                    sm50_reuse_reg(&op.srcs[2]),
+                ],
+            }
+        }
+        _ => [None, None, None],
+    }
+}
+
+/// Maxwell operand reuse. Each instruction's control bits can ask the operand
+/// collector to keep the value it read in slot A, B or C for the next
+/// instruction, which then takes that operand from the reuse cache instead of
+/// the register file. That avoids register-bank conflicts (four banks, one read
+/// port each), which otherwise cost an extra cycle whenever two operands of one
+/// instruction live in the same bank. NVIDIA's compiler sets these flags all
+/// the time; NAK never did (InstrDeps::add_reuse had no caller).
+///
+/// The cached value is not invalidated by a later write, so the rules are strict
+/// and all local to two neighbouring instructions of one basic block (the second
+/// cannot be a branch target):
+/// - both are unpredicated instructions of sm50_reuse_slots, and the first does
+///   not yield;
+/// - the same single GPR sits in the same slot in both;
+/// - the first instruction does not write that register;
+/// - the second waits on no scoreboard, so no variable-latency result can land
+///   in between.
+/// The computation is unchanged either way; only register-file reads are saved.
+fn assign_reuse_flags_sm50(f: &mut Function) {
+    for b in f.blocks.iter_mut() {
+        for i in 1..b.instrs.len() {
+            let (head, tail) = b.instrs.split_at_mut(i);
+            let cur = &mut head[i - 1];
+            let next = &tail[0];
+
+            if !cur.pred.is_true() || !next.pred.is_true() {
+                continue;
+            }
+            if cur.deps.yld || next.deps.wt_bar_mask != 0 {
+                continue;
+            }
+
+            let cur_slots = sm50_reuse_slots(&cur.op);
+            let next_slots = sm50_reuse_slots(&next.op);
+
+            for slot in 0..3 {
+                let (Some(reg), Some(next_reg)) =
+                    (cur_slots[slot], next_slots[slot])
+                else {
+                    continue;
+                };
+                if reg != next_reg {
+                    continue;
+                }
+
+                let written = cur.dsts().iter().any(|dst| match dst {
+                    Dst::Reg(dst_reg) => {
+                        dst_reg.file() == RegFile::GPR
+                            && dst_reg.idx_range().contains(&reg.base_idx())
+                    }
+                    _ => false,
+                });
+                if written {
+                    continue;
+                }
+
+                cur.deps.add_reuse(slot as u8);
+            }
+        }
+    }
+}
+
 impl Shader<'_> {
     pub fn assign_deps_serial(&mut self) {
         for f in &mut self.functions {
@@ -1105,6 +1214,9 @@ impl Shader<'_> {
             for f in &mut self.functions {
                 assign_barriers(f, self.sm);
                 min_num_static_cycles += calc_delays(f, self.sm);
+                if self.sm.is_maxwell() && DEBUG.reuse() {
+                    assign_reuse_flags_sm50(f);
+                }
             }
 
             if DEBUG.cycles() {

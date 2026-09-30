@@ -5,6 +5,36 @@ use crate::ir::*;
 use compiler::cfg::CFG;
 use std::cmp::max;
 use std::cmp::Reverse;
+use std::sync::OnceLock;
+
+/// NFSMW/UnleashedRecomp: the latencies estimate_variable_latency assumes for textures, memory
+/// and attribute access, in cycles. NAK_TEX_LATENCY, NAK_MEM_LATENCY and NAK_ATTR_LATENCY (1 to
+/// 1000) replace them, to measure other values without rebuilding. They only change the
+/// scheduler's priorities, i.e. instruction order and register pressure, never a result; NVK
+/// hashes them into its shader cache keys (nak_sched_latency_key).
+pub struct SchedLatencies {
+    pub tex: u32,
+    pub mem: u32,
+    pub attr: u32,
+}
+
+pub fn sched_latencies() -> &'static SchedLatencies {
+    static LATENCIES: OnceLock<SchedLatencies> = OnceLock::new();
+    LATENCIES.get_or_init(|| {
+        let read = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value >= 1 && *value <= 1000)
+                .unwrap_or(default)
+        };
+        SchedLatencies {
+            tex: read("NAK_TEX_LATENCY", 200),
+            mem: read("NAK_MEM_LATENCY", 200),
+            attr: read("NAK_ATTR_LATENCY", 200),
+        }
+    })
+}
 
 pub mod graph {
     #[derive(Clone)]
@@ -294,7 +324,7 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         | Op::Tld4(_)
         | Op::Tmml(_)
         | Op::Txd(_)
-        | Op::Txq(_) => 200,
+        | Op::Txq(_) => sched_latencies().tex,
 
         // Surface ops
         Op::SuLd(_)
@@ -313,16 +343,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         | Op::St(_)
         | Op::StSCheckUnlock(_)
         | Op::Atom(_)
-        | Op::AL2P(_)
-        | Op::ALd(_)
-        | Op::ASt(_)
-        | Op::Ipa(_)
         | Op::CCtl(_)
         | Op::LdTram(_)
         // Like textures, a global memory load from shared LPDDR4 does not take
-        // 32 cycles. Ipa and ALd are cheaper, but they share the same match arm and the only effect
-        // of overestimating them is placing them earlier.
-        | Op::MemBar(_) => 200,
+        // 32 cycles.
+        | Op::MemBar(_) => sched_latencies().mem,
+
+        // Attribute access. Cheaper than memory; overestimating it places the loads earlier,
+        // which keeps every interpolated input live from the top of the shader.
+        Op::AL2P(_) | Op::ALd(_) | Op::ASt(_) | Op::Ipa(_) => {
+            sched_latencies().attr
+        }
 
         // Control-flow ops
         Op::WarpSync(_) => 16,

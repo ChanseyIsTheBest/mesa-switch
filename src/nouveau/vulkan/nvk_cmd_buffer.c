@@ -1687,7 +1687,10 @@ nvk_sw_empezar_bufer(struct nvk_cmd_buffer *cmd)
    if (entorno > 0) {
       for (uint32_t m = 0; m < NVK_SW_MEJORAS; m++) {
          const struct nvk_sw_mejora_estado *e = &nvk_switch_dibujo.mejoras[m];
-         if (p_atomic_read_relaxed(&e->pedido) != 0 &&
+         /* Only for an app that asks for it (nfsmw-nx writes pedido = 1 on
+          * every submit): any other app gets the usual path.
+          */
+         if (p_atomic_read_relaxed(&e->pedido) > 0 &&
              p_atomic_read_relaxed(&e->apagado) == 0)
             sw->activas |= 1u << m;
       }

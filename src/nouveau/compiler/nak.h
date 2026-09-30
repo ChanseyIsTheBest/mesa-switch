@@ -26,6 +26,8 @@ struct nak_compiler *nak_compiler_create(const struct nv_device_info *dev);
 void nak_compiler_destroy(struct nak_compiler *nak);
 
 uint64_t nak_debug_flags(const struct nak_compiler *nak);
+/* NFSMW/UnleashedRecomp: NAK_TEX_LATENCY/NAK_MEM_LATENCY/NAK_ATTR_LATENCY, for cache keys */
+uint32_t nak_sched_latency_key(void);
 
 const struct nir_shader_compiler_options *
 nak_nir_options(const struct nak_compiler *nak);

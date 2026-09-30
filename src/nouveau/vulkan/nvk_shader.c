@@ -72,6 +72,41 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *size = comp_size * length, *align = comp_size;
 }
 
+static bool nvk_link_varyings_enabled(void);
+
+/* NFSMW: the pipeline has only a vertex shader, and no fragment shader will
+ * come from anywhere else. ds is filled whenever the state has the fragment
+ * shader part (always, for VK_EXT_dynamic_rendering_unused_attachments), so
+ * with ds present shader_stages says whether there is a fragment shader at
+ * all; a pre-rasterization library without that part gets its fragment
+ * shader later and is left alone. Depth-only passes are drawn like this.
+ */
+static bool
+nvk_vs_only_pipeline(const struct vk_graphics_pipeline_state *state)
+{
+   /* NVK_SWITCH_VS_ONLY_VARYINGS=0 turns just this part off (also in the key) */
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("NVK_SWITCH_VS_ONLY_VARYINGS", true);
+
+   return enabled && state != NULL && state->ds != NULL &&
+          state->shader_stages == VK_SHADER_STAGE_VERTEX_BIT &&
+          nvk_link_varyings_enabled();
+}
+
+/* 30-bit NAK scheduler latency key folded into 15 bits (0 for the defaults) */
+static uint32_t
+nvk_fold_latency_key(uint32_t key)
+{
+   const uint32_t defaults = 200u | (200u << 10) | (200u << 20);
+   if (key == defaults)
+      return 0;
+   uint32_t h = key * 0x9e3779b1u;
+   h ^= h >> 15;
+   h &= 0x7fff;
+   return h != 0 ? h : 1;
+}
+
 uint64_t
 nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
 {
@@ -88,8 +123,14 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
       | (UINT64_C(9) << 16) /* Compiler ABI revision. */
       /* NFSMW: revision of our NAK fixes. It is hashed into the pipeline cache UUID and the disk cache
        * keys, and on Horizon the build id is the package version, so without it the old (miscompiled) shaders
-       * would be reused. 1 = SM50 FADD32I dropped .SAT. Bump it with every NAK fix. */
-      | (UINT64_C(1) << 24)
+       * would be reused. 1 = SM50 FADD32I dropped .SAT, 2 = Maxwell operand reuse on by default,
+       * 3 = unread varyings dropped from linked pipelines, 4 = operand reuse also on
+       * FMNMX/FSET/FSETP/SEL and the scheduler latency knobs. Bump it with every NAK change. */
+      | (UINT64_C(4) << 24)
+      /* NVK_LINK_VARYINGS changes the code of linked pipelines. */
+      | (nvk_link_varyings_enabled() ? UINT64_C(1) << 32 : 0)
+      /* NAK_TEX_LATENCY/NAK_MEM_LATENCY/NAK_ATTR_LATENCY change the schedule: 15 bits of their key. */
+      | ((uint64_t)nvk_fold_latency_key(nak_sched_latency_key()) << 33)
       | (nak_flags << 48);
 }
 
@@ -302,6 +343,13 @@ nvk_hash_state(struct vk_physical_device *device,
 {
    struct mesa_blake3 blake3_ctx;
    _mesa_blake3_init(&blake3_ctx);
+   /* NFSMW: the vertex shader of a pipeline without a fragment shader is
+    * compiled without its varyings (nvk_link_shader_varyings).
+    */
+   if ((stages & VK_SHADER_STAGE_VERTEX_BIT) && nvk_vs_only_pipeline(state)) {
+      const uint32_t vs_only = 0x5346534e; /* "NSFS" */
+      _mesa_blake3_update(&blake3_ctx, &vs_only, sizeof(vs_only));
+   }
    if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
       struct nak_fs_key key;
       nvk_populate_fs_key(&key, state);
@@ -647,18 +695,30 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
    shader->info = shader->nak->info;
    /* Registers, spills and occupancy of each shader (NVK_SHADER_STATS=1). On GM20B occupancy is set
     * by the registers, and a spill to local memory is very expensive with 21 GB/s shared.
+    * "spirv" is the start of the BLAKE3 of the SPIR-V the shader came from (MESA_SPIRV_DUMP_PATH
+    * names files with the same hash); UnleashedRecomp's draw profiler prints it next to each
+    * expensive shader, so the two logs can be joined. The same SPIR-V appears once per
+    * specialization/pipeline state it is compiled for.
     */
    {
       static int nvk_shader_stats = -1;
       if (nvk_shader_stats < 0)
          nvk_shader_stats = debug_get_bool_option("NVK_SHADER_STATS", false);
       if (nvk_shader_stats) {
-         mesa_logi("estadisticas de shader: etapa %u, %u registros, %u B de memoria local, "
-                   "%u warps por SM, %u B de codigo",
-                   (unsigned)nir->info.stage, (unsigned)shader->info.num_gprs,
+         const unsigned char *b3 = nir->info.source_blake3;
+         mesa_logi("estadisticas de shader: %s spirv %02x%02x%02x%02x, %u registros, "
+                   "%u B de memoria local, %u warps por SM, %u B de codigo, %u instrucciones, "
+                   "%" PRIu64 " ciclos estaticos, %u/%u spills/fills a memoria",
+                   _mesa_shader_stage_to_abbrev(nir->info.stage),
+                   b3[0], b3[1], b3[2], b3[3],
+                   (unsigned)shader->info.num_gprs,
                    (unsigned)shader->info.slm_size,
                    nak_max_warps_per_sm(shader->info.num_gprs, pdev->nak),
-                   (unsigned)shader->nak->code_size);
+                   (unsigned)shader->nak->code_size,
+                   (unsigned)shader->nak->info.num_instrs,
+                   (uint64_t)shader->nak->info.num_static_cycles,
+                   (unsigned)shader->nak->info.num_spills_to_mem,
+                   (unsigned)shader->nak->info.num_fills_from_mem);
       }
    }
    shader->asm_str = shader->nak->asm_str;
@@ -1363,6 +1423,204 @@ nvk_compile_nir_shader(struct nvk_device *dev, nir_shader *nir,
    return VK_SUCCESS;
 }
 
+/* NFSMW/UnleashedRecomp: varying components the fragment shader never reads are dropped from the last
+ * pre-rasterization stage when the two are linked into one pipeline (the pipeline runtime then sets
+ * VK_SHADER_CREATE_LINK_STAGE_BIT_EXT and keys both shaders on both). Their stores go, so the math and
+ * the vertex fetches that only fed them go too, and each vertex writes fewer attributes. The fragment
+ * shader reads exactly the values it read before, so the image cannot change. Only generic 32-bit
+ * vector/scalar varyings are touched, and only components the fragment shader reads through direct
+ * whole-variable loads can be found unread: any other access to an input (array index, interpolateAt,
+ * copy) keeps all of that input. Nothing is done with transform feedback. NVK_LINK_VARYINGS=0 turns it
+ * off.
+ */
+static bool
+nvk_link_varyings_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("NVK_LINK_VARYINGS", true);
+   return enabled;
+}
+
+static void
+nvk_mark_fs_input_reads(uint8_t *reads, const nir_variable *var,
+                        nir_component_mask_t comps)
+{
+   const unsigned slots = glsl_count_attribute_slots(var->type, false);
+   for (unsigned s = 0; s < slots; s++) {
+      const unsigned slot = var->data.location + s;
+      if (slot < VARYING_SLOT_MAX)
+         reads[slot] |= comps & 0xf;
+   }
+}
+
+static void
+nvk_gather_fs_input_reads(nir_shader *fs, uint8_t *reads)
+{
+   nir_foreach_function_impl(impl, fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type != nir_deref_type_var ||
+                deref->var->data.mode != nir_var_shader_in)
+               continue;
+
+            const nir_variable *var = deref->var;
+            const bool simple = glsl_type_is_vector_or_scalar(var->type) &&
+                                glsl_get_bit_size(var->type) == 32;
+
+            nir_component_mask_t comps = 0;
+            bool everything = !simple;
+            nir_foreach_use_including_if(src, &deref->def) {
+               if (!nir_src_is_if(src)) {
+                  nir_instr *use = nir_src_use_instr(src);
+                  if (use->type == nir_instr_type_intrinsic &&
+                      nir_instr_as_intrinsic(use)->intrinsic == nir_intrinsic_load_deref) {
+                     comps |= nir_def_components_read(&nir_instr_as_intrinsic(use)->def);
+                     continue;
+                  }
+               }
+               everything = true;
+            }
+
+            nvk_mark_fs_input_reads(reads, var,
+                                    everything ? 0xf : (comps << var->data.location_frac));
+         }
+      }
+   }
+
+   /* Inputs other than 32-bit vectors/scalars keep everything, whatever the scan saw. */
+   nir_foreach_shader_in_variable(var, fs) {
+      if (var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      if (!glsl_type_is_vector_or_scalar(var->type) || glsl_get_bit_size(var->type) != 32)
+         nvk_mark_fs_input_reads(reads, var, 0xf);
+   }
+}
+
+static bool
+nvk_drop_unread_outputs(nir_shader *producer, const uint8_t *reads)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, producer) {
+      bool impl_progress = false;
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (deref == NULL || deref->deref_type != nir_deref_type_var)
+               continue;
+
+            const nir_variable *var = deref->var;
+            if (var->data.mode != nir_var_shader_out ||
+                var->data.location < VARYING_SLOT_VAR0 ||
+                var->data.location > VARYING_SLOT_VAR31 ||
+                var->data.explicit_xfb_buffer || var->data.always_active_io ||
+                !glsl_type_is_vector_or_scalar(var->type) ||
+                glsl_get_bit_size(var->type) != 32)
+               continue;
+
+            const unsigned num_comps = glsl_get_vector_elements(var->type);
+            const nir_component_mask_t read =
+               (reads[var->data.location] >> var->data.location_frac) & BITFIELD_MASK(num_comps);
+            const nir_component_mask_t write_mask = nir_intrinsic_write_mask(intr);
+            const nir_component_mask_t kept = write_mask & read;
+            if (kept == write_mask)
+               continue;
+
+            if (kept == 0)
+               nir_instr_remove(instr);
+            else
+               nir_intrinsic_set_write_mask(intr, kept);
+
+            impl_progress = true;
+         }
+      }
+
+      if (impl_progress) {
+         nir_progress(true, impl, nir_metadata_control_flow);
+         progress = true;
+      }
+   }
+
+   return progress;
+}
+
+static void
+nvk_link_shader_varyings(uint32_t shader_count, struct vk_shader_compile_info *infos,
+                         const struct vk_graphics_pipeline_state *state)
+{
+   /* NFSMW: no fragment shader reads anything: every generic output of the
+    * vertex shader goes (position, clip/cull distances, point size, layer and
+    * viewport are not generic and stay). The vertex shader is compiled alone
+    * here, without the link flag.
+    */
+   if (shader_count == 1 && infos[0].stage == MESA_SHADER_VERTEX &&
+       infos[0].nir->xfb_info == NULL && nvk_vs_only_pipeline(state)) {
+      const uint8_t reads[VARYING_SLOT_MAX] = { 0 };
+      nir_shader *nir = infos[0].nir;
+      if (nvk_drop_unread_outputs(nir, reads)) {
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      }
+      return;
+   }
+
+   if (shader_count < 2 || !nvk_link_varyings_enabled())
+      return;
+
+   int fs = -1, producer = -1;
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (!(infos[i].flags & VK_SHADER_CREATE_LINK_STAGE_BIT_EXT))
+         continue;
+
+      switch (infos[i].stage) {
+      case MESA_SHADER_FRAGMENT:
+         fs = i;
+         break;
+      case MESA_SHADER_VERTEX:
+      case MESA_SHADER_TESS_EVAL:
+      case MESA_SHADER_GEOMETRY:
+         /* The last one before the fragment stage is the one that feeds it. */
+         if (producer < 0 || infos[i].stage > infos[producer].stage)
+            producer = i;
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (fs < 0 || producer < 0 || infos[producer].nir->xfb_info != NULL)
+      return;
+
+   nir_shader *consumer = infos[fs].nir;
+
+   /* Colour writes to attachments that do not exist go first (see nvk_quitar_color_muerto), so the
+    * inputs only they used count as unread.
+    */
+   nvk_quitar_color_muerto(consumer, nvk_color_rt_mask(state));
+
+   uint8_t reads[VARYING_SLOT_MAX] = { 0 };
+   nvk_gather_fs_input_reads(consumer, reads);
+
+   nir_shader *nir = infos[producer].nir;
+   if (nvk_drop_unread_outputs(nir, reads)) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+}
+
 static VkResult
 nvk_compile_shaders(struct vk_device *vk_dev,
                     uint32_t shader_count,
@@ -1373,6 +1631,8 @@ nvk_compile_shaders(struct vk_device *vk_dev,
                     struct vk_shader **shaders_out)
 {
    struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
+
+   nvk_link_shader_varyings(shader_count, infos, state);
 
    for (uint32_t i = 0; i < shader_count; i++) {
       VkResult result = nvk_compile_shader(dev, &infos[i], state,

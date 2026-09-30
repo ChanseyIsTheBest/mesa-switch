@@ -305,7 +305,7 @@ struct nvk_switch_set4_cuentas {
  */
 struct nvk_switch_set4 {
    int32_t version;  /* 1 */
-   int32_t pedido;   /* lo escribe la app: 1 si, 0 no; -1 no lo dice */
+   int32_t pedido;   /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= no: solo con pedido) */
    int32_t entorno;  /* NVK_SWITCH_DYN_UBO_DELTA: -1 sin leer, 0 no, 1 si */
    int32_t apagado;  /* 1: la guardia vio una DIFERENCIA (para la sesion) */
    struct nvk_switch_set4_cuentas total; /* de los buferes terminados */
@@ -323,7 +323,7 @@ nvk_switch_set4_activo(void)
    if (unlikely(entorno < 0))
       entorno = nvk_switch_set4_leer_entorno();
    return entorno > 0 &&
-          p_atomic_read_relaxed(&nvk_switch_set4.pedido) != 0 &&
+          p_atomic_read_relaxed(&nvk_switch_set4.pedido) > 0 &&
           p_atomic_read_relaxed(&nvk_switch_set4.apagado) == 0;
 }
 
@@ -409,7 +409,7 @@ struct nvk_sw_parte_total {
 };
 
 struct nvk_sw_mejora_estado {
-   int32_t pedido;         /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= si) */
+   int32_t pedido;         /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= no: solo con pedido) */
    int32_t apagado;        /* 1: su guardia vio una DIFERENCIA (para la sesion) */
    uint64_t usos;          /* veces que se decidio por el camino nuevo */
    uint64_t validadas;     /* comprobaciones de la guardia que salieron iguales */

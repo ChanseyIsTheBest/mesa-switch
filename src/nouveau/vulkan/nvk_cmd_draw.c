@@ -15,6 +15,8 @@
 
 #include "util/bitpack_helpers.h"
 #include "util/compiler.h"
+#include "util/log.h"
+#include "util/u_debug.h"
 #include "vk_format.h"
 #include "vk_render_pass.h"
 #include "vk_standard_sample_locations.h"
@@ -1351,6 +1353,44 @@ nvk_get_zcull_plane(struct nvk_rendering_state *render) {
    return NULL;
 }
 
+/* ZCULL experiments for reverse-Z applications (NVK_ZCULL):
+ *   less     (default) ZDIR_LESS for every depth target, as the blob does.
+ *   greater  ZDIR_GREATER for every depth target. A reverse-Z main pass (GREATER depth tests)
+ *            may only get hierarchical culling this way; depth passes with LESS tests lose it.
+ *   off      ZCULL never enabled, to measure what it gives.
+ * Each mode keeps one direction for the whole run, so ZCULL data saved with STORE_ZCULL is
+ * always loaded back with the direction it was written with.
+ */
+enum nvk_zcull_mode {
+   NVK_ZCULL_LESS,
+   NVK_ZCULL_GREATER,
+   NVK_ZCULL_OFF,
+};
+
+DEBUG_GET_ONCE_OPTION(nvk_zcull, "NVK_ZCULL", "less")
+
+static enum nvk_zcull_mode
+nvk_get_zcull_mode(void)
+{
+   static int mode = -1;
+   if (likely(mode >= 0))
+      return mode;
+
+   const char *option = debug_get_option_nvk_zcull();
+   int m = NVK_ZCULL_LESS;
+   if (!strcmp(option, "greater"))
+      m = NVK_ZCULL_GREATER;
+   else if (!strcmp(option, "off"))
+      m = NVK_ZCULL_OFF;
+   else if (strcmp(option, "less"))
+      mesa_logw("[nvk] NVK_ZCULL=%s is not less, greater or off; using less", option);
+
+   static const char *const names[] = { "less", "greater", "off" };
+   mesa_logi("[nvk] ZCULL mode: %s (NVK_ZCULL)", names[m]);
+   mode = m;
+   return mode;
+}
+
 static uint32_t
 nvk_vk_format_to_zcull_format(VkFormat format) {
    switch (format) {
@@ -1692,7 +1732,9 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    /* TODO: zcull for depth-stencil */
    struct nvk_zcull_plane *zcull_plane = nvk_get_zcull_plane(render);
-   bool use_zcull = pdev->info.has_zcull_info &&
+   const enum nvk_zcull_mode zcull_mode = nvk_get_zcull_mode();
+   bool use_zcull = zcull_mode != NVK_ZCULL_OFF &&
+      pdev->info.has_zcull_info &&
       pRenderingInfo->pDepthAttachment != NULL &&
       pRenderingInfo->pDepthAttachment->imageView != VK_NULL_HANDLE &&
       pRenderingInfo->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_NONE &&
@@ -1764,8 +1806,9 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       P_IMMD(p, NV9097, SET_ZCULL_DIR_FORMAT, {
          /* I've tried a variety of depthCompareOp values and depth clear
           * values, but the blob seems to always use ZDIR_LESS
+          * (NVK_ZCULL=greater tries the other direction, see above).
           */
-         .zdir = ZDIR_LESS,
+         .zdir = zcull_mode == NVK_ZCULL_GREATER ? ZDIR_GREATER : ZDIR_LESS,
          .zformat = nvk_vk_format_to_zcull_format(fmt),
       });
 
@@ -1990,7 +2033,7 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    struct nvk_rendering_state *render = &cmd->state.gfx.render;
 
    struct nvk_zcull_plane* zcull_plane = nvk_get_zcull_plane(render);
-   if (zcull_plane &&
+   if (zcull_plane && nvk_get_zcull_mode() != NVK_ZCULL_OFF &&
        render->depth_att.store_op == VK_ATTACHMENT_STORE_OP_STORE) {
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
       P_IMMD(p, NV9097, STORE_ZCULL, 0);

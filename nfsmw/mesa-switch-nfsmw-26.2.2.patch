@@ -1,5 +1,5 @@
 diff --git a/bindgen-switch-wrapper.sh b/bindgen-switch-wrapper.sh
-index 36cadd7..1c6879c 100755
+index 36cadd70..1c6879c7 100755
 --- a/bindgen-switch-wrapper.sh
 +++ b/bindgen-switch-wrapper.sh
 @@ -36,6 +36,12 @@ else
@@ -16,7 +16,7 @@ index 36cadd7..1c6879c 100755
  inject_done=0
  set -- "$@" "__BINDGEN_WRAPPER_END__"
 diff --git a/build-switch.sh b/build-switch.sh
-index cc2722d..95a6faa 100755
+index cc2722da..95a6faa1 100755
 --- a/build-switch.sh
 +++ b/build-switch.sh
 @@ -4,6 +4,17 @@ set -e
@@ -55,8 +55,41 @@ index cc2722d..95a6faa 100755
      -Db_lto=false \
      -Db_ndebug=true \
      -Dvulkan-drivers=nouveau \
+diff --git a/build-unified.sh b/build-unified.sh
+index 5e1aac76..452a97f7 100755
+--- a/build-unified.sh
++++ b/build-unified.sh
+@@ -120,6 +120,11 @@ if [[ -f "${BUILD_DIR}/meson-private/coredata.dat" ]]; then
+     setup_mode+=(--wipe)
+ fi
+ 
++# MESA_SWITCH_INCREMENTAL=1 keeps an existing build directory and only rebuilds what changed
++# (source edits need no reconfigure; ninja reruns meson itself when a meson.build changes).
++if [[ "${MESA_SWITCH_INCREMENTAL:-0}" == 1 && -f "${BUILD_DIR}/build.ninja" ]]; then
++    echo "Incremental build in ${BUILD_DIR} (MESA_SWITCH_INCREMENTAL=1)"
++else
+ "${MESON_BIN}" setup "${BUILD_DIR}" "${setup_mode[@]}" \
+     --cross-file "${CROSS_FILE}" \
+     --native-file "${NATIVE_FILE}" \
+@@ -153,8 +158,15 @@ fi
+     -Dcpp_rtti=false \
+     -Dbuild-tests=false \
+     -Dnvk-build-id="$(git rev-parse HEAD)"
++fi
+ 
+-"${NINJA_BIN}" -C "${BUILD_DIR}"
++# The bindgen steps for the several nvidia/hwref/*/dev_mmu.h headers all write the depfile
++# src/nouveau/headers/dev_mmu.h.d; on Windows two of them running at once can fail with
++# "Permission denied". A second ninja run finishes whatever the first one left.
++if ! "${NINJA_BIN}" -C "${BUILD_DIR}"; then
++    echo "ninja failed; retrying once (parallel bindgen steps can collide on Windows)" >&2
++    "${NINJA_BIN}" -C "${BUILD_DIR}"
++fi
+ 
+ case "${DESTDIR}" in
+     "${ROOT_DIR}"/mesa-unified-install*) ;;
 diff --git a/meson.build b/meson.build
-index 60ad845..575f732 100644
+index 60ad8452..575f7323 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -1990,7 +1990,8 @@ if with_clc
@@ -70,7 +103,7 @@ index 60ad845..575f732 100644
  if draw_with_llvm
    llvm_modules += 'native'
 diff --git a/rustc-native-msys2-wrapper.sh b/rustc-native-msys2-wrapper.sh
-index b77dfeb..01ebe1f 100644
+index b77dfeb1..01ebe1f7 100644
 --- a/rustc-native-msys2-wrapper.sh
 +++ b/rustc-native-msys2-wrapper.sh
 @@ -44,4 +44,12 @@ for arg in "$@"; do
@@ -88,7 +121,7 @@ index b77dfeb..01ebe1f 100644
 +[ -n "$NATIVE_LINKER" ] || NATIVE_LINKER="$(command -v gcc || command -v cc)"
 +exec "$RUSTC_BIN" -C linker="$NATIVE_LINKER" "${ARGS[@]}"
 diff --git a/rustc-switch-wrapper.sh b/rustc-switch-wrapper.sh
-index 008e20d..d48196d 100755
+index 008e20db..d48196d5 100755
 --- a/rustc-switch-wrapper.sh
 +++ b/rustc-switch-wrapper.sh
 @@ -65,6 +65,8 @@ done
@@ -100,11 +133,252 @@ index 008e20d..d48196d 100755
  if [ ! -x "$FALLBACK_LINKER" ]; then
      FALLBACK_LINKER="$(command -v cc || command -v gcc || true)"
  fi
+diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+index c53f3bc2..ec273ccb 100644
+--- a/src/nouveau/compiler/nak.h
++++ b/src/nouveau/compiler/nak.h
+@@ -26,6 +26,8 @@ struct nak_compiler *nak_compiler_create(const struct nv_device_info *dev);
+ void nak_compiler_destroy(struct nak_compiler *nak);
+ 
+ uint64_t nak_debug_flags(const struct nak_compiler *nak);
++/* NFSMW/UnleashedRecomp: NAK_TEX_LATENCY/NAK_MEM_LATENCY/NAK_ATTR_LATENCY, for cache keys */
++uint32_t nak_sched_latency_key(void);
+ 
+ const struct nir_shader_compiler_options *
+ nak_nir_options(const struct nak_compiler *nak);
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 3bcd1ab2..1422c61f 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -28,6 +28,8 @@ enum DebugFlags {
+     Annotate,
+     NoUgpr,
+     Cycles,
++    NoReuse,
++    ReuseBasic,
+ }
+ 
+ pub struct Debug {
+@@ -54,6 +56,10 @@ impl Debug {
+                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
+                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
++                "noreuse" => flags |= 1 << DebugFlags::NoReuse as u8,
++                "reusebasic" => flags |= 1 << DebugFlags::ReuseBasic as u8,
++                // Operand reuse used to be opt-in; it is the default now.
++                "reuse" => (),
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -91,6 +97,21 @@ pub trait GetDebugFlags {
+     fn cycles(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
+     }
++
++    /// Maxwell operand-reuse flags (see assign_reuse_flags_sm50). On by default
++    /// since it was validated on hardware; NAK_DEBUG=noreuse turns it off. Being
++    /// a NAK_DEBUG flag, that is part of the value NVK hashes into its shader
++    /// cache keys, so binaries built with and without reuse never mix.
++    fn reuse(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::NoReuse as u8) == 0
++    }
++
++    /// NAK_DEBUG=reusebasic limits operand reuse to FADD/FMUL/FFMA, the set that
++    /// was validated on hardware first; by default FMNMX, FSET, FSETP and SEL
++    /// take part as well.
++    fn reuse_basic(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::ReuseBasic as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -223,6 +244,14 @@ pub extern "C" fn nak_debug_flags(_nak: *const nak_compiler) -> u64 {
+     DEBUG.debug_flags().into()
+ }
+ 
++/// NFSMW/UnleashedRecomp: the scheduler latencies (NAK_TEX_LATENCY, NAK_MEM_LATENCY,
++/// NAK_ATTR_LATENCY), 10 bits each, for NVK's shader cache keys.
++#[no_mangle]
++pub extern "C" fn nak_sched_latency_key() -> u32 {
++    let latencies = crate::opt_instr_sched_common::sched_latencies();
++    latencies.tex | (latencies.mem << 10) | (latencies.attr << 20)
++}
++
+ #[no_mangle]
+ pub extern "C" fn nak_nir_options(
+     nak: *const nak_compiler,
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index c89c3357..45c24c8e 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -1059,6 +1059,115 @@ fn calc_delays(f: &mut Function, sm: &ShaderModelInfo) -> u64 {
+     min_num_static_cycles
+ }
+ 
++/// The register a source reads, if it is a single 32-bit GPR (RZ, immediates and
++/// constant-buffer operands have nothing to reuse).
++fn sm50_reuse_reg(src: &Src) -> Option<RegRef> {
++    match &src.src_ref {
++        SrcRef::Reg(reg) if reg.file() == RegFile::GPR && reg.comps() == 1 => {
++            Some(*reg)
++        }
++        _ => None,
++    }
++}
++
++/// The register operand in each of the hardware operand slots A, B and C, for the
++/// instructions handled here, exactly as sm50.rs encodes them:
++/// - FADD, FMUL, and (unless NAK_DEBUG=reusebasic) FMNMX, FSET, FSETP and SEL:
++///   src0 in A (bits 8..16); src1 in B (bits 20..28) in the register form, while
++///   the immediate and constant-buffer forms have no register in B. The other
++///   fields of the last four (a predicate in 39..42, the comparison) are no
++///   register operands.
++/// - FFMA: src0 in A; with src2 a register, src1 in B (register form only) and
++///   src2 in C (bits 39..47); with src2 in the constant buffer, src1 moves to C.
++fn sm50_reuse_slots(op: &Op) -> [Option<RegRef>; 3] {
++    let two_srcs = |srcs: &[Src; 2]| -> [Option<RegRef>; 3] {
++        [sm50_reuse_reg(&srcs[0]), sm50_reuse_reg(&srcs[1]), None]
++    };
++
++    match op {
++        Op::FAdd(op) => two_srcs(&op.srcs),
++        Op::FMul(op) => two_srcs(&op.srcs),
++        Op::FMnMx(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
++        Op::FSet(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
++        Op::FSetP(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
++        Op::Sel(op) if !DEBUG.reuse_basic() => two_srcs(&op.srcs),
++        Op::FFma(op) => {
++            let a = sm50_reuse_reg(&op.srcs[0]);
++            match &op.srcs[2].src_ref {
++                SrcRef::CBuf(_) => [a, None, sm50_reuse_reg(&op.srcs[1])],
++                _ => [
++                    a,
++                    sm50_reuse_reg(&op.srcs[1]),
++                    sm50_reuse_reg(&op.srcs[2]),
++                ],
++            }
++        }
++        _ => [None, None, None],
++    }
++}
++
++/// Maxwell operand reuse. Each instruction's control bits can ask the operand
++/// collector to keep the value it read in slot A, B or C for the next
++/// instruction, which then takes that operand from the reuse cache instead of
++/// the register file. That avoids register-bank conflicts (four banks, one read
++/// port each), which otherwise cost an extra cycle whenever two operands of one
++/// instruction live in the same bank. NVIDIA's compiler sets these flags all
++/// the time; NAK never did (InstrDeps::add_reuse had no caller).
++///
++/// The cached value is not invalidated by a later write, so the rules are strict
++/// and all local to two neighbouring instructions of one basic block (the second
++/// cannot be a branch target):
++/// - both are unpredicated instructions of sm50_reuse_slots, and the first does
++///   not yield;
++/// - the same single GPR sits in the same slot in both;
++/// - the first instruction does not write that register;
++/// - the second waits on no scoreboard, so no variable-latency result can land
++///   in between.
++/// The computation is unchanged either way; only register-file reads are saved.
++fn assign_reuse_flags_sm50(f: &mut Function) {
++    for b in f.blocks.iter_mut() {
++        for i in 1..b.instrs.len() {
++            let (head, tail) = b.instrs.split_at_mut(i);
++            let cur = &mut head[i - 1];
++            let next = &tail[0];
++
++            if !cur.pred.is_true() || !next.pred.is_true() {
++                continue;
++            }
++            if cur.deps.yld || next.deps.wt_bar_mask != 0 {
++                continue;
++            }
++
++            let cur_slots = sm50_reuse_slots(&cur.op);
++            let next_slots = sm50_reuse_slots(&next.op);
++
++            for slot in 0..3 {
++                let (Some(reg), Some(next_reg)) =
++                    (cur_slots[slot], next_slots[slot])
++                else {
++                    continue;
++                };
++                if reg != next_reg {
++                    continue;
++                }
++
++                let written = cur.dsts().iter().any(|dst| match dst {
++                    Dst::Reg(dst_reg) => {
++                        dst_reg.file() == RegFile::GPR
++                            && dst_reg.idx_range().contains(&reg.base_idx())
++                    }
++                    _ => false,
++                });
++                if written {
++                    continue;
++                }
++
++                cur.deps.add_reuse(slot as u8);
++            }
++        }
++    }
++}
++
+ impl Shader<'_> {
+     pub fn assign_deps_serial(&mut self) {
+         for f in &mut self.functions {
+@@ -1105,6 +1214,9 @@ impl Shader<'_> {
+             for f in &mut self.functions {
+                 assign_barriers(f, self.sm);
+                 min_num_static_cycles += calc_delays(f, self.sm);
++                if self.sm.is_maxwell() && DEBUG.reuse() {
++                    assign_reuse_flags_sm50(f);
++                }
+             }
+ 
+             if DEBUG.cycles() {
 diff --git a/src/nouveau/compiler/nak/opt_instr_sched_common.rs b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
-index 2d8be48..8cbce26 100644
+index 2d8be486..c9365dd2 100644
 --- a/src/nouveau/compiler/nak/opt_instr_sched_common.rs
 +++ b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
-@@ -284,12 +284,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+@@ -5,6 +5,36 @@ use crate::ir::*;
+ use compiler::cfg::CFG;
+ use std::cmp::max;
+ use std::cmp::Reverse;
++use std::sync::OnceLock;
++
++/// NFSMW/UnleashedRecomp: the latencies estimate_variable_latency assumes for textures, memory
++/// and attribute access, in cycles. NAK_TEX_LATENCY, NAK_MEM_LATENCY and NAK_ATTR_LATENCY (1 to
++/// 1000) replace them, to measure other values without rebuilding. They only change the
++/// scheduler's priorities, i.e. instruction order and register pressure, never a result; NVK
++/// hashes them into its shader cache keys (nak_sched_latency_key).
++pub struct SchedLatencies {
++    pub tex: u32,
++    pub mem: u32,
++    pub attr: u32,
++}
++
++pub fn sched_latencies() -> &'static SchedLatencies {
++    static LATENCIES: OnceLock<SchedLatencies> = OnceLock::new();
++    LATENCIES.get_or_init(|| {
++        let read = |name: &str, default: u32| {
++            std::env::var(name)
++                .ok()
++                .and_then(|value| value.trim().parse::<u32>().ok())
++                .filter(|value| *value >= 1 && *value <= 1000)
++                .unwrap_or(default)
++        };
++        SchedLatencies {
++            tex: read("NAK_TEX_LATENCY", 200),
++            mem: read("NAK_MEM_LATENCY", 200),
++            attr: read("NAK_ATTR_LATENCY", 200),
++        }
++    })
++}
+ 
+ pub mod graph {
+     #[derive(Clone)]
+@@ -284,12 +314,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
          Op::Redux(_) | Op::R2UR(_) => 15,
  
          // Texture ops
@@ -119,24 +393,35 @@ index 2d8be48..8cbce26 100644
          | Op::Tmml(_)
          | Op::Txd(_)
 -        | Op::Txq(_) => 32,
-+        | Op::Txq(_) => 200,
++        | Op::Txq(_) => sched_latencies().tex,
  
          // Surface ops
          Op::SuLd(_)
-@@ -314,7 +319,10 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
-         | Op::Ipa(_)
+@@ -308,13 +343,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+         | Op::St(_)
+         | Op::StSCheckUnlock(_)
+         | Op::Atom(_)
+-        | Op::AL2P(_)
+-        | Op::ALd(_)
+-        | Op::ASt(_)
+-        | Op::Ipa(_)
          | Op::CCtl(_)
          | Op::LdTram(_)
 -        | Op::MemBar(_) => 32,
 +        // Like textures, a global memory load from shared LPDDR4 does not take
-+        // 32 cycles. Ipa and ALd are cheaper, but they share the same match arm and the only effect
-+        // of overestimating them is placing them earlier.
-+        | Op::MemBar(_) => 200,
++        // 32 cycles.
++        | Op::MemBar(_) => sched_latencies().mem,
++
++        // Attribute access. Cheaper than memory; overestimating it places the loads earlier,
++        // which keeps every interpolated input live from the top of the shader.
++        Op::AL2P(_) | Op::ALd(_) | Op::ASt(_) | Op::Ipa(_) => {
++            sched_latencies().attr
++        }
  
          // Control-flow ops
          Op::WarpSync(_) => 16,
 diff --git a/src/nouveau/compiler/nak/sm50.rs b/src/nouveau/compiler/nak/sm50.rs
-index 294d71f..f010543 100644
+index 294d71f5..f0105438 100644
 --- a/src/nouveau/compiler/nak/sm50.rs
 +++ b/src/nouveau/compiler/nak/sm50.rs
 @@ -486,9 +486,12 @@ impl SM50Op for OpFAdd {
@@ -155,7 +440,7 @@ index 294d71f..f010543 100644
          }
      }
 diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
-index beb01b1..3f55767 100644
+index beb01b1d..3f55767f 100644
 --- a/src/nouveau/compiler/nak_nir.c
 +++ b/src/nouveau/compiler/nak_nir.c
 @@ -203,8 +203,19 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
@@ -180,7 +465,7 @@ index beb01b1..3f55767 100644
        };
        LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
 diff --git a/src/nouveau/horizon/nouveau_horizon.h b/src/nouveau/horizon/nouveau_horizon.h
-index 5f5d3c1..465f725 100644
+index 5f5d3c1a..465f725a 100644
 --- a/src/nouveau/horizon/nouveau_horizon.h
 +++ b/src/nouveau/horizon/nouveau_horizon.h
 @@ -432,6 +432,14 @@ nouveau_horizon_runtime_shutdown(void (*step)(const char *what));
@@ -199,7 +484,7 @@ index 5f5d3c1..465f725 100644
  nouveau_horizon_device_create(
     struct nouveau_horizon_runtime *runtime,
 diff --git a/src/nouveau/horizon/nouveau_horizon_device.c b/src/nouveau/horizon/nouveau_horizon_device.c
-index 7824c9b..1d6bc23 100644
+index 7824c9bf..1d6bc233 100644
 --- a/src/nouveau/horizon/nouveau_horizon_device.c
 +++ b/src/nouveau/horizon/nouveau_horizon_device.c
 @@ -61,19 +61,31 @@ nouveau_horizon_get_gm20b_info(struct nv_device_info *info_out)
@@ -257,7 +542,7 @@ index 7824c9b..1d6bc23 100644
     const nvioctl_gpu_characteristics *gpu_info = nvGpuGetCharacteristics();
     device->page_size_B = nouveau_horizon_choose_page_size(gpu_info);
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
-index 6dc4995..32576a6 100644
+index 6dc4995a..e987a3cc 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
 @@ -18,6 +18,9 @@
@@ -436,7 +721,7 @@ index 6dc4995..32576a6 100644
        for (uint32_t i = 0; i < ARRAY_SIZE(group->cbufs); i++) {
           const struct nvk_cbuf *cbuf = &group->cbufs[i];
           switch (cbuf->type) {
-@@ -1269,9 +1374,375 @@ nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
+@@ -1269,8 +1374,377 @@ nvk_cmd_dirty_cbufs_for_descriptors(struct nvk_cmd_buffer *cmd,
              UNREACHABLE("Invalid cbuf type");
           }
        }
@@ -586,7 +871,7 @@ index 6dc4995..32576a6 100644
 +         cmd->state.set4.escrituras_raiz++;
 +         cmd->state.set4.dwords_raiz += n;
 +      }
-    }
++   }
 +   if (fin > inicio) {
 +      desc->dyn_synced |= BITFIELD64_RANGE(inicio, fin - inicio);
 +      cmd->state.set4.enlaces_diferencia++;
@@ -609,8 +894,8 @@ index 6dc4995..32576a6 100644
 +      desc->dyn_synced |= BITFIELD64_RANGE(inicio, fin - inicio);
 +   if (desc == &cmd->state.gfx.descriptors && fin > inicio)
 +      cmd->state.set4.enlaces_completos++;
- }
- 
++}
++
 +/* Like nvk_cmd_dirty_cbufs_for_descriptors, but the DYNAMIC_UBO cbufs are only
 + * dirtied if the descriptor they read changed value. The DESC_SET and
 + * UBO_DESC ones of the bound sets are always dirtied, as before.
@@ -664,8 +949,8 @@ index 6dc4995..32576a6 100644
 +            cmd->state.set4.cbufs_ahorrados++;
 +         }
 +      }
-+   }
-+}
+    }
+ }
 +#endif
 +
 +#ifdef HAVE_SWITCH_PLATFORM
@@ -753,7 +1038,10 @@ index 6dc4995..32576a6 100644
 +   if (entorno > 0) {
 +      for (uint32_t m = 0; m < NVK_SW_MEJORAS; m++) {
 +         const struct nvk_sw_mejora_estado *e = &nvk_switch_dibujo.mejoras[m];
-+         if (p_atomic_read_relaxed(&e->pedido) != 0 &&
++         /* Only for an app that asks for it (nfsmw-nx writes pedido = 1 on
++          * every submit): any other app gets the usual path.
++          */
++         if (p_atomic_read_relaxed(&e->pedido) > 0 &&
 +             p_atomic_read_relaxed(&e->apagado) == 0)
 +            sw->activas |= 1u << m;
 +      }
@@ -808,11 +1096,10 @@ index 6dc4995..32576a6 100644
 +   }
 +}
 +#endif
-+
+ 
  static void
  nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
-                          struct nvk_descriptor_state *desc,
-@@ -1309,6 +1780,9 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
+@@ -1309,6 +1783,9 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
        pipeline_layout->dynamic_descriptor_offset[info->firstSet];
     uint8_t dyn_buffer_end = dyn_buffer_start;
  
@@ -822,7 +1109,7 @@ index 6dc4995..32576a6 100644
     uint32_t next_dyn_offset = 0;
     for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
        unsigned s = i + info->firstSet;
-@@ -1329,6 +1803,14 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
+@@ -1329,6 +1806,14 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
           nvk_descriptor_state_set_root(cmd, desc, sets[s], set_addr);
        }
  
@@ -837,7 +1124,7 @@ index 6dc4995..32576a6 100644
        set_dynamic_buffer_start[s] = dyn_buffer_end;
  
        if (pipeline_layout->set_layouts[s] != NULL) {
-@@ -1364,21 +1846,67 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
+@@ -1364,21 +1849,67 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
     assert(dyn_buffer_end <= NVK_MAX_DYNAMIC_BUFFERS);
     assert(next_dyn_offset <= info->dynamicOffsetCount);
  
@@ -908,7 +1195,7 @@ index 6dc4995..32576a6 100644
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -1388,6 +1916,18 @@ nvk_CmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
+@@ -1388,6 +1919,18 @@ nvk_CmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
  
     if (pBindDescriptorSetsInfo->stageFlags & NVK_VK_GRAPHICS_STAGE_BITS) {
@@ -927,7 +1214,7 @@ index 6dc4995..32576a6 100644
        nvk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
                                 pBindDescriptorSetsInfo);
     }
-@@ -1595,8 +2135,18 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
+@@ -1595,8 +2138,18 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
     VkResult result;
  
     u_foreach_bit(set_idx, desc->push_dirty) {
@@ -948,7 +1235,7 @@ index 6dc4995..32576a6 100644
        struct nvk_push_descriptor_set *push_set = desc->sets[set_idx].push;
        uint32_t upload_size_B = align(push_set->size_B, min_cbuf_alignment);
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
-index c0ea422..8f1f12b 100644
+index c0ea422b..82f9c12d 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
 @@ -121,6 +121,22 @@ struct nvk_descriptor_state {
@@ -1050,7 +1337,7 @@ index c0ea422..8f1f12b 100644
 + */
 +struct nvk_switch_set4 {
 +   int32_t version;  /* 1 */
-+   int32_t pedido;   /* lo escribe la app: 1 si, 0 no; -1 no lo dice */
++   int32_t pedido;   /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= no: solo con pedido) */
 +   int32_t entorno;  /* NVK_SWITCH_DYN_UBO_DELTA: -1 sin leer, 0 no, 1 si */
 +   int32_t apagado;  /* 1: la guardia vio una DIFERENCIA (para la sesion) */
 +   struct nvk_switch_set4_cuentas total; /* de los buferes terminados */
@@ -1068,7 +1355,7 @@ index c0ea422..8f1f12b 100644
 +   if (unlikely(entorno < 0))
 +      entorno = nvk_switch_set4_leer_entorno();
 +   return entorno > 0 &&
-+          p_atomic_read_relaxed(&nvk_switch_set4.pedido) != 0 &&
++          p_atomic_read_relaxed(&nvk_switch_set4.pedido) > 0 &&
 +          p_atomic_read_relaxed(&nvk_switch_set4.apagado) == 0;
 +}
 +
@@ -1154,7 +1441,7 @@ index c0ea422..8f1f12b 100644
 +};
 +
 +struct nvk_sw_mejora_estado {
-+   int32_t pedido;         /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= si) */
++   int32_t pedido;         /* lo escribe la app: 1 si, 0 no; -1 no lo dice (= no: solo con pedido) */
 +   int32_t apagado;        /* 1: su guardia vio una DIFERENCIA (para la sesion) */
 +   uint64_t usos;          /* veces que se decidio por el camino nuevo */
 +   uint64_t validadas;     /* comprobaciones de la guardia que salieron iguales */
@@ -1365,10 +1652,19 @@ index c0ea422..8f1f12b 100644
  nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
                               uint64_t addr, uint32_t dw_count);
 diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
-index 7720f13..b77a127 100644
+index 7720f135..7c5e3a28 100644
 --- a/src/nouveau/vulkan/nvk_cmd_draw.c
 +++ b/src/nouveau/vulkan/nvk_cmd_draw.c
-@@ -774,6 +774,137 @@ nvk_cmd_buffer_dirty_render_pass(struct nvk_cmd_buffer *cmd)
+@@ -15,6 +15,8 @@
+ 
+ #include "util/bitpack_helpers.h"
+ #include "util/compiler.h"
++#include "util/log.h"
++#include "util/u_debug.h"
+ #include "vk_format.h"
+ #include "vk_render_pass.h"
+ #include "vk_standard_sample_locations.h"
+@@ -774,6 +776,137 @@ nvk_cmd_buffer_dirty_render_pass(struct nvk_cmd_buffer *cmd)
     BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE);
  }
  
@@ -1506,7 +1802,7 @@ index 7720f13..b77a127 100644
  static void
  nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
                              struct nvk_descriptor_state *desc,
-@@ -785,6 +916,12 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+@@ -785,6 +918,12 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
     const uint32_t start_dw = offset / 4;
     const uint32_t end_dw = DIV_ROUND_UP(offset + size, 4);
     const uint32_t *root_dw = (uint32_t *)desc->root;
@@ -1519,7 +1815,7 @@ index 7720f13..b77a127 100644
  
     if (nvk_use_hw_root_table(&pdev->info, true)) {
        const uint32_t TABLE_SIZE_DW = NVK_HW_ROOT_TABLE_SIZE / sizeof(uint32_t);
-@@ -813,11 +950,29 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+@@ -813,11 +952,29 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
        const uint32_t len_dw = end_dw - start_dw;
  
        struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + len_dw);
@@ -1549,7 +1845,7 @@ index 7720f13..b77a127 100644
  }
  
  void
-@@ -848,6 +1003,10 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+@@ -848,6 +1005,10 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
     }
  
     cmd->state.gfx.descriptors.flush_root = nvk_cmd_flush_gfx_root_desc;
@@ -1560,7 +1856,83 @@ index 7720f13..b77a127 100644
  
     if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
         (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
-@@ -1939,6 +2098,32 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+@@ -1192,6 +1353,44 @@ nvk_get_zcull_plane(struct nvk_rendering_state *render) {
+    return NULL;
+ }
+ 
++/* ZCULL experiments for reverse-Z applications (NVK_ZCULL):
++ *   less     (default) ZDIR_LESS for every depth target, as the blob does.
++ *   greater  ZDIR_GREATER for every depth target. A reverse-Z main pass (GREATER depth tests)
++ *            may only get hierarchical culling this way; depth passes with LESS tests lose it.
++ *   off      ZCULL never enabled, to measure what it gives.
++ * Each mode keeps one direction for the whole run, so ZCULL data saved with STORE_ZCULL is
++ * always loaded back with the direction it was written with.
++ */
++enum nvk_zcull_mode {
++   NVK_ZCULL_LESS,
++   NVK_ZCULL_GREATER,
++   NVK_ZCULL_OFF,
++};
++
++DEBUG_GET_ONCE_OPTION(nvk_zcull, "NVK_ZCULL", "less")
++
++static enum nvk_zcull_mode
++nvk_get_zcull_mode(void)
++{
++   static int mode = -1;
++   if (likely(mode >= 0))
++      return mode;
++
++   const char *option = debug_get_option_nvk_zcull();
++   int m = NVK_ZCULL_LESS;
++   if (!strcmp(option, "greater"))
++      m = NVK_ZCULL_GREATER;
++   else if (!strcmp(option, "off"))
++      m = NVK_ZCULL_OFF;
++   else if (strcmp(option, "less"))
++      mesa_logw("[nvk] NVK_ZCULL=%s is not less, greater or off; using less", option);
++
++   static const char *const names[] = { "less", "greater", "off" };
++   mesa_logi("[nvk] ZCULL mode: %s (NVK_ZCULL)", names[m]);
++   mode = m;
++   return mode;
++}
++
+ static uint32_t
+ nvk_vk_format_to_zcull_format(VkFormat format) {
+    switch (format) {
+@@ -1533,7 +1732,9 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    /* TODO: zcull for depth-stencil */
+    struct nvk_zcull_plane *zcull_plane = nvk_get_zcull_plane(render);
+-   bool use_zcull = pdev->info.has_zcull_info &&
++   const enum nvk_zcull_mode zcull_mode = nvk_get_zcull_mode();
++   bool use_zcull = zcull_mode != NVK_ZCULL_OFF &&
++      pdev->info.has_zcull_info &&
+       pRenderingInfo->pDepthAttachment != NULL &&
+       pRenderingInfo->pDepthAttachment->imageView != VK_NULL_HANDLE &&
+       pRenderingInfo->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_NONE &&
+@@ -1605,8 +1806,9 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       P_IMMD(p, NV9097, SET_ZCULL_DIR_FORMAT, {
+          /* I've tried a variety of depthCompareOp values and depth clear
+           * values, but the blob seems to always use ZDIR_LESS
++          * (NVK_ZCULL=greater tries the other direction, see above).
+           */
+-         .zdir = ZDIR_LESS,
++         .zdir = zcull_mode == NVK_ZCULL_GREATER ? ZDIR_GREATER : ZDIR_LESS,
+          .zformat = nvk_vk_format_to_zcull_format(fmt),
+       });
+ 
+@@ -1831,7 +2033,7 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    struct nvk_rendering_state *render = &cmd->state.gfx.render;
+ 
+    struct nvk_zcull_plane* zcull_plane = nvk_get_zcull_plane(render);
+-   if (zcull_plane &&
++   if (zcull_plane && nvk_get_zcull_mode() != NVK_ZCULL_OFF &&
+        render->depth_att.store_op == VK_ATTACHMENT_STORE_OP_STORE) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+       P_IMMD(p, NV9097, STORE_ZCULL, 0);
+@@ -1939,6 +2141,32 @@ nvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     }
  }
  
@@ -1593,7 +1965,7 @@ index 7720f13..b77a127 100644
  void
  nvk_cmd_bind_graphics_shader(struct nvk_cmd_buffer *cmd,
                               const mesa_shader_stage stage,
-@@ -1959,6 +2144,13 @@ nvk_cmd_bind_graphics_shader(struct nvk_cmd_buffer *cmd,
+@@ -1959,6 +2187,13 @@ nvk_cmd_bind_graphics_shader(struct nvk_cmd_buffer *cmd,
  
     cmd->state.gfx.shaders[stage] = shader;
     cmd->state.gfx.shaders_dirty |= mesa_to_vk_shader_stage(stage);
@@ -1607,7 +1979,7 @@ index 7720f13..b77a127 100644
  }
  
  #define NVK_MME_TESS_PARAMS(domain, spacing, prims) \
-@@ -2303,12 +2495,71 @@ const struct nvk_mme_test_case nvk_mme_set_tess_params_tests[] = {{
+@@ -2303,12 +2538,71 @@ const struct nvk_mme_test_case nvk_mme_set_tess_params_tests[] = {{
  },
  {}};
  
@@ -1679,7 +2051,7 @@ index 7720f13..b77a127 100644
     /* Map shader types to shaders */
     struct nvk_shader *type_shader[6] = { NULL, };
     uint32_t types_dirty = 0;
-@@ -2346,6 +2597,10 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
+@@ -2346,6 +2640,10 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
                         sizeof(cbuf_group->cbufs[i])) != 0) {
                 cbuf_group->cbufs[i] = cbuf_map->cbufs[i];
                 cbuf_group->dirty |= BITFIELD_BIT(i);
@@ -1690,7 +2062,7 @@ index 7720f13..b77a127 100644
              }
           }
        }
-@@ -2394,6 +2649,14 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
+@@ -2394,6 +2692,14 @@ nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd)
        nv_push_raw(p, &last_vtgm->push_dw[dw_start], dw_count);
     }
  
@@ -1705,7 +2077,7 @@ index 7720f13..b77a127 100644
     cmd->state.gfx.shaders_dirty = 0;
  }
  
-@@ -4214,6 +4477,143 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
+@@ -4214,6 +4520,143 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
     }
  }
  
@@ -1849,7 +2221,7 @@ index 7720f13..b77a127 100644
  void
  nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd)
  {
-@@ -4223,6 +4623,14 @@ nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd)
+@@ -4223,6 +4666,14 @@ nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd)
     if (!vk_dynamic_graphics_state_any_dirty(dyn))
        return;
  
@@ -1864,7 +2236,7 @@ index 7720f13..b77a127 100644
     nvk_flush_vi_state(cmd);
     nvk_flush_ia_state(cmd);
     nvk_flush_ts_state(cmd);
-@@ -4324,6 +4732,78 @@ nvk_mme_bind_cbuf_desc(struct mme_builder *b)
+@@ -4324,6 +4775,78 @@ nvk_mme_bind_cbuf_desc(struct mme_builder *b)
     mme_emit(b, cb);
  }
  
@@ -1943,7 +2315,7 @@ index 7720f13..b77a127 100644
  void
  nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
  {
-@@ -4332,13 +4812,29 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4332,13 +4855,29 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
     const uint32_t min_cbuf_alignment = nvk_min_cbuf_alignment(&pdev->info);
     struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
  
@@ -1975,7 +2347,7 @@ index 7720f13..b77a127 100644
     for (mesa_shader_stage stage = 0; stage < MESA_SHADER_MESH_STAGES; stage++) {
        const struct nvk_shader *shader = cmd->state.gfx.shaders[stage];
        if (shader == NULL)
-@@ -4348,7 +4844,37 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4348,7 +4887,37 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
        assert(group < ARRAY_SIZE(cbuf_shaders));
        cbuf_shaders[group] = shader;
     }
@@ -1991,10 +2363,10 @@ index 7720f13..b77a127 100644
 +   }
 +   }
 +#endif
-+
+ 
 +#ifdef HAVE_SWITCH_PLATFORM
 +   const bool comprobar_set4 = nvk_switch_set4_toca_comprobar(cmd); /* NFSMW */
- 
++
 +   /* NFSMW: NVK_SW_M_CBUFS. With no dirty cbuf in use, the
 +    * loop below neither emits nor changes anything: it is skipped. The guard checks
 +    * that nothing is really dirty and runs the loop as always.
@@ -2013,7 +2385,7 @@ index 7720f13..b77a127 100644
     bool bound_any_cbuf = false;
     for (uint32_t g = 0; g < ARRAY_SIZE(cbuf_shaders); g++) {
        if (cbuf_shaders[g] == NULL)
-@@ -4358,6 +4884,12 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4358,6 +4927,12 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
        const struct nvk_cbuf_map *cbuf_map = &shader->cbuf_map;
        struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
  
@@ -2026,7 +2398,7 @@ index 7720f13..b77a127 100644
        /* We only bother to re-bind cbufs that are in use */
        const uint32_t rebind =
           group->dirty & BITFIELD_MASK(cbuf_map->cbuf_count);
-@@ -4372,6 +4904,10 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4372,6 +4947,10 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
              continue;
  
           bound_any_cbuf = true;
@@ -2037,7 +2409,7 @@ index 7720f13..b77a127 100644
  
           struct nvk_buffer_address ba;
           if (nvk_cmd_buffer_get_cbuf_addr(cmd, desc, shader, cbuf, &ba)) {
-@@ -4381,6 +4917,15 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4381,6 +4960,15 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
  
              struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
  
@@ -2053,7 +2425,7 @@ index 7720f13..b77a127 100644
              if (ba.size > 0) {
                 P_MTHD(p, NV9097, SET_CONSTANT_BUFFER_SELECTOR_A);
                 P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_A(p, ba.size);
-@@ -4392,6 +4937,16 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4392,6 +4980,16 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
                 .valid = ba.size > 0,
                 .shader_slot = c,
              });
@@ -2070,7 +2442,7 @@ index 7720f13..b77a127 100644
           } else {
              uint64_t desc_addr =
                 nvk_cmd_buffer_get_cbuf_descriptor_addr(cmd, desc, cbuf);
-@@ -4439,8 +4994,156 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+@@ -4439,8 +5037,156 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
        P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
        P_INLINE_DATA(p, 0);
     }
@@ -2081,8 +2453,8 @@ index 7720f13..b77a127 100644
 +   if (sw_cbufs)
 +      cmd->state.gfx.sw_cbufs_limpios = nvk_sw_cbufs_estan_limpios(cmd, cbuf_shaders);
 +#endif
-+}
-+
+ }
+ 
 +#ifdef HAVE_SWITCH_PLATFORM
 +/* NFSMW: per-part measurement (see nvk_switch_dibujo in
 + * nvk_cmd_buffer.c). None of this changes a command or a state.
@@ -2117,8 +2489,8 @@ index 7720f13..b77a127 100644
 +                   (size_t)MAX2(shader->push_dw_count,
 +                                shader->vtgm_push_dw_count) * 4);
 +   }
- }
- 
++}
++
 +static void
 +nvk_sw_contar_antes_del_flush(struct nvk_cmd_buffer *cmd)
 +{
@@ -2227,7 +2599,7 @@ index 7720f13..b77a127 100644
  static void
  nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
  {
-@@ -4454,10 +5157,37 @@ nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
+@@ -4454,10 +5200,37 @@ nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
                                         dev->interlock_memory->va->addr);
        }
     }
@@ -2265,7 +2637,7 @@ index 7720f13..b77a127 100644
  
     if (NAK_CAN_PRINTF)
        nvk_cmd_buffer_flush_printf_buffer(cmd, &cmd->state.gfx.descriptors);
-@@ -4674,12 +5404,31 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+@@ -4674,12 +5447,31 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
        cmd->state.gfx.vb0 = addr_range;
  
     struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
@@ -2297,7 +2669,7 @@ index 7720f13..b77a127 100644
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -4689,6 +5438,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
+@@ -4689,6 +5481,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
                               const VkBindVertexBuffer3InfoKHR* pBindingInfos)
  {
     VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
@@ -2307,7 +2679,7 @@ index 7720f13..b77a127 100644
  
     vk_cmd_set_vertex_binding_strides2(&cmd->vk, firstBinding,
                                         bindingCount, pBindingInfos);
-@@ -4704,6 +5456,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
+@@ -4704,6 +5499,9 @@ nvk_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer,
  
        nvk_cmd_bind_vertex_buffer(cmd, idx, addr_range);
     }
@@ -2317,7 +2689,7 @@ index 7720f13..b77a127 100644
  }
  
  static void
-@@ -4944,15 +5699,44 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+@@ -4944,15 +5742,44 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
     if (unlikely(!vertexCount || !instanceCount))
        return;
  
@@ -2362,7 +2734,7 @@ index 7720f13..b77a127 100644
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -5122,9 +5906,29 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -5122,9 +5949,29 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
     if (unlikely(!indexCount || !instanceCount))
        return;
  
@@ -2392,7 +2764,7 @@ index 7720f13..b77a127 100644
     P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED));
     P_INLINE_DATA(p, 0 /* draw_index */);
     P_INLINE_DATA(p, indexCount);
-@@ -5132,6 +5936,18 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -5132,6 +5979,18 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
     P_INLINE_DATA(p, firstIndex);
     P_INLINE_DATA(p, vertexOffset);
     P_INLINE_DATA(p, firstInstance);
@@ -2412,7 +2784,7 @@ index 7720f13..b77a127 100644
  
  VKAPI_ATTR void VKAPI_CALL
 diff --git a/src/nouveau/vulkan/nvk_cmd_meta.c b/src/nouveau/vulkan/nvk_cmd_meta.c
-index 00e5936..2de9177 100644
+index 00e59365..2de91777 100644
 --- a/src/nouveau/vulkan/nvk_cmd_meta.c
 +++ b/src/nouveau/vulkan/nvk_cmd_meta.c
 @@ -12,6 +12,8 @@
@@ -2495,7 +2867,7 @@ index 00e5936..2de9177 100644
     } else {
        nvk_cmd_copy_buffer_ce(cmd, pCopyBufferInfo);
 diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
-index 3124edd..77520c8 100644
+index 3124edd3..77520c8a 100644
 --- a/src/nouveau/vulkan/nvk_image.c
 +++ b/src/nouveau/vulkan/nvk_image.c
 @@ -2,6 +2,7 @@
@@ -2562,7 +2934,7 @@ index 3124edd..77520c8 100644
     const enum pipe_format plane0_format = image->planes[0].nil.format.p_format;
     if (plane0_format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
 diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
-index 1ae52b9..e4abae6 100644
+index 1ae52b90..1838b99f 100644
 --- a/src/nouveau/vulkan/nvk_shader.c
 +++ b/src/nouveau/vulkan/nvk_shader.c
 @@ -2,6 +2,7 @@
@@ -2582,18 +2954,66 @@ index 1ae52b9..e4abae6 100644
  #include "nir.h"
  #include "nir_builder.h"
  #include "compiler/spirv/nir_spirv.h"
-@@ -83,6 +86,10 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+@@ -69,6 +72,41 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
+    *size = comp_size * length, *align = comp_size;
+ }
+ 
++static bool nvk_link_varyings_enabled(void);
++
++/* NFSMW: the pipeline has only a vertex shader, and no fragment shader will
++ * come from anywhere else. ds is filled whenever the state has the fragment
++ * shader part (always, for VK_EXT_dynamic_rendering_unused_attachments), so
++ * with ds present shader_stages says whether there is a fragment shader at
++ * all; a pre-rasterization library without that part gets its fragment
++ * shader later and is left alone. Depth-only passes are drawn like this.
++ */
++static bool
++nvk_vs_only_pipeline(const struct vk_graphics_pipeline_state *state)
++{
++   /* NVK_SWITCH_VS_ONLY_VARYINGS=0 turns just this part off (also in the key) */
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = debug_get_bool_option("NVK_SWITCH_VS_ONLY_VARYINGS", true);
++
++   return enabled && state != NULL && state->ds != NULL &&
++          state->shader_stages == VK_SHADER_STAGE_VERTEX_BIT &&
++          nvk_link_varyings_enabled();
++}
++
++/* 30-bit NAK scheduler latency key folded into 15 bits (0 for the defaults) */
++static uint32_t
++nvk_fold_latency_key(uint32_t key)
++{
++   const uint32_t defaults = 200u | (200u << 10) | (200u << 20);
++   if (key == defaults)
++      return 0;
++   uint32_t h = key * 0x9e3779b1u;
++   h ^= h >> 15;
++   h &= 0x7fff;
++   return h != 0 ? h : 1;
++}
++
+ uint64_t
+ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+ {
+@@ -83,6 +121,16 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
        | (use_edb_buffer_views ? 1 << 13 : 0)
        | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
        | (UINT64_C(9) << 16) /* Compiler ABI revision. */
 +      /* NFSMW: revision of our NAK fixes. It is hashed into the pipeline cache UUID and the disk cache
 +       * keys, and on Horizon the build id is the package version, so without it the old (miscompiled) shaders
-+       * would be reused. 1 = SM50 FADD32I dropped .SAT. Bump it with every NAK fix. */
-+      | (UINT64_C(1) << 24)
++       * would be reused. 1 = SM50 FADD32I dropped .SAT, 2 = Maxwell operand reuse on by default,
++       * 3 = unread varyings dropped from linked pipelines, 4 = operand reuse also on
++       * FMNMX/FSET/FSETP/SEL and the scheduler latency knobs. Bump it with every NAK change. */
++      | (UINT64_C(4) << 24)
++      /* NVK_LINK_VARYINGS changes the code of linked pipelines. */
++      | (nvk_link_varyings_enabled() ? UINT64_C(1) << 32 : 0)
++      /* NAK_TEX_LATENCY/NAK_MEM_LATENCY/NAK_ATTR_LATENCY change the schedule: 15 bits of their key. */
++      | ((uint64_t)nvk_fold_latency_key(nak_sched_latency_key()) << 33)
        | (nak_flags << 48);
  }
  
-@@ -175,6 +182,70 @@ nvk_preprocess_nir(struct vk_physical_device *vk_pdev,
+@@ -175,6 +223,70 @@ nvk_preprocess_nir(struct vk_physical_device *vk_pdev,
     }
  }
  
@@ -2664,7 +3084,19 @@ index 1ae52b9..e4abae6 100644
  static void
  nvk_populate_fs_key(struct nak_fs_key *key,
                      const struct vk_graphics_pipeline_state *state)
-@@ -236,6 +307,10 @@ nvk_hash_state(struct vk_physical_device *device,
+@@ -231,11 +343,22 @@ nvk_hash_state(struct vk_physical_device *device,
+ {
+    struct mesa_blake3 blake3_ctx;
+    _mesa_blake3_init(&blake3_ctx);
++   /* NFSMW: the vertex shader of a pipeline without a fragment shader is
++    * compiled without its varyings (nvk_link_shader_varyings).
++    */
++   if ((stages & VK_SHADER_STAGE_VERTEX_BIT) && nvk_vs_only_pipeline(state)) {
++      const uint32_t vs_only = 0x5346534e; /* "NSFS" */
++      _mesa_blake3_update(&blake3_ctx, &vs_only, sizeof(vs_only));
++   }
+    if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
+       struct nak_fs_key key;
        nvk_populate_fs_key(&key, state);
        _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
  
@@ -2675,30 +3107,42 @@ index 1ae52b9..e4abae6 100644
        /* This doesn't impact the shader compile but it does go in the
         * nvk_shader and gets [de]serialized along with the binary so we
         * need to hash it.
-@@ -570,6 +645,22 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
+@@ -570,6 +693,34 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
        return vk_errorf(pdev, VK_ERROR_UNKNOWN, "Internal compiler error in NAK");
  
     shader->info = shader->nak->info;
 +   /* Registers, spills and occupancy of each shader (NVK_SHADER_STATS=1). On GM20B occupancy is set
 +    * by the registers, and a spill to local memory is very expensive with 21 GB/s shared.
++    * "spirv" is the start of the BLAKE3 of the SPIR-V the shader came from (MESA_SPIRV_DUMP_PATH
++    * names files with the same hash); UnleashedRecomp's draw profiler prints it next to each
++    * expensive shader, so the two logs can be joined. The same SPIR-V appears once per
++    * specialization/pipeline state it is compiled for.
 +    */
 +   {
 +      static int nvk_shader_stats = -1;
 +      if (nvk_shader_stats < 0)
 +         nvk_shader_stats = debug_get_bool_option("NVK_SHADER_STATS", false);
 +      if (nvk_shader_stats) {
-+         mesa_logi("estadisticas de shader: etapa %u, %u registros, %u B de memoria local, "
-+                   "%u warps por SM, %u B de codigo",
-+                   (unsigned)nir->info.stage, (unsigned)shader->info.num_gprs,
++         const unsigned char *b3 = nir->info.source_blake3;
++         mesa_logi("estadisticas de shader: %s spirv %02x%02x%02x%02x, %u registros, "
++                   "%u B de memoria local, %u warps por SM, %u B de codigo, %u instrucciones, "
++                   "%" PRIu64 " ciclos estaticos, %u/%u spills/fills a memoria",
++                   _mesa_shader_stage_to_abbrev(nir->info.stage),
++                   b3[0], b3[1], b3[2], b3[3],
++                   (unsigned)shader->info.num_gprs,
 +                   (unsigned)shader->info.slm_size,
 +                   nak_max_warps_per_sm(shader->info.num_gprs, pdev->nak),
-+                   (unsigned)shader->nak->code_size);
++                   (unsigned)shader->nak->code_size,
++                   (unsigned)shader->nak->info.num_instrs,
++                   (uint64_t)shader->nak->info.num_static_cycles,
++                   (unsigned)shader->nak->info.num_spills_to_mem,
++                   (unsigned)shader->nak->info.num_fills_from_mem);
 +      }
 +   }
     shader->asm_str = shader->nak->asm_str;
     shader->code_ptr = shader->nak->code;
     shader->code_size = shader->nak->code_size;
-@@ -940,22 +1031,26 @@ nvk_shader_fill_push(struct nvk_device *dev,
+@@ -940,22 +1091,26 @@ nvk_shader_fill_push(struct nvk_device *dev,
     } else if (shader->info.stage == MESA_SHADER_FRAGMENT) {
        max_dw_count += 13;
  
@@ -2740,7 +3184,7 @@ index 1ae52b9..e4abae6 100644
        P_NV9097_SET_SUBTILING_PERF_KNOB_B(p, 0x20);
  
        P_IMMD(p, NV9097, SET_API_MANDATED_EARLY_Z,
-@@ -1194,6 +1289,7 @@ nvk_compile_shader(struct nvk_device *dev,
+@@ -1194,6 +1349,7 @@ nvk_compile_shader(struct nvk_device *dev,
     if (nir->info.stage == MESA_SHADER_FRAGMENT) {
        nvk_populate_fs_key(&fs_key_tmp, state);
        fs_key = &fs_key_tmp;
@@ -2748,7 +3192,221 @@ index 1ae52b9..e4abae6 100644
     }
  
     result = nvk_compile_nir(dev, nir, info->flags, info->robustness,
-@@ -1630,6 +1726,11 @@ const struct vk_device_shader_ops nvk_device_shader_ops = {
+@@ -1267,6 +1423,204 @@ nvk_compile_nir_shader(struct nvk_device *dev, nir_shader *nir,
+    return VK_SUCCESS;
+ }
+ 
++/* NFSMW/UnleashedRecomp: varying components the fragment shader never reads are dropped from the last
++ * pre-rasterization stage when the two are linked into one pipeline (the pipeline runtime then sets
++ * VK_SHADER_CREATE_LINK_STAGE_BIT_EXT and keys both shaders on both). Their stores go, so the math and
++ * the vertex fetches that only fed them go too, and each vertex writes fewer attributes. The fragment
++ * shader reads exactly the values it read before, so the image cannot change. Only generic 32-bit
++ * vector/scalar varyings are touched, and only components the fragment shader reads through direct
++ * whole-variable loads can be found unread: any other access to an input (array index, interpolateAt,
++ * copy) keeps all of that input. Nothing is done with transform feedback. NVK_LINK_VARYINGS=0 turns it
++ * off.
++ */
++static bool
++nvk_link_varyings_enabled(void)
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = debug_get_bool_option("NVK_LINK_VARYINGS", true);
++   return enabled;
++}
++
++static void
++nvk_mark_fs_input_reads(uint8_t *reads, const nir_variable *var,
++                        nir_component_mask_t comps)
++{
++   const unsigned slots = glsl_count_attribute_slots(var->type, false);
++   for (unsigned s = 0; s < slots; s++) {
++      const unsigned slot = var->data.location + s;
++      if (slot < VARYING_SLOT_MAX)
++         reads[slot] |= comps & 0xf;
++   }
++}
++
++static void
++nvk_gather_fs_input_reads(nir_shader *fs, uint8_t *reads)
++{
++   nir_foreach_function_impl(impl, fs) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_deref)
++               continue;
++
++            nir_deref_instr *deref = nir_instr_as_deref(instr);
++            if (deref->deref_type != nir_deref_type_var ||
++                deref->var->data.mode != nir_var_shader_in)
++               continue;
++
++            const nir_variable *var = deref->var;
++            const bool simple = glsl_type_is_vector_or_scalar(var->type) &&
++                                glsl_get_bit_size(var->type) == 32;
++
++            nir_component_mask_t comps = 0;
++            bool everything = !simple;
++            nir_foreach_use_including_if(src, &deref->def) {
++               if (!nir_src_is_if(src)) {
++                  nir_instr *use = nir_src_use_instr(src);
++                  if (use->type == nir_instr_type_intrinsic &&
++                      nir_instr_as_intrinsic(use)->intrinsic == nir_intrinsic_load_deref) {
++                     comps |= nir_def_components_read(&nir_instr_as_intrinsic(use)->def);
++                     continue;
++                  }
++               }
++               everything = true;
++            }
++
++            nvk_mark_fs_input_reads(reads, var,
++                                    everything ? 0xf : (comps << var->data.location_frac));
++         }
++      }
++   }
++
++   /* Inputs other than 32-bit vectors/scalars keep everything, whatever the scan saw. */
++   nir_foreach_shader_in_variable(var, fs) {
++      if (var->data.location < VARYING_SLOT_VAR0)
++         continue;
++      if (!glsl_type_is_vector_or_scalar(var->type) || glsl_get_bit_size(var->type) != 32)
++         nvk_mark_fs_input_reads(reads, var, 0xf);
++   }
++}
++
++static bool
++nvk_drop_unread_outputs(nir_shader *producer, const uint8_t *reads)
++{
++   bool progress = false;
++
++   nir_foreach_function_impl(impl, producer) {
++      bool impl_progress = false;
++
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_store_deref)
++               continue;
++
++            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
++            if (deref == NULL || deref->deref_type != nir_deref_type_var)
++               continue;
++
++            const nir_variable *var = deref->var;
++            if (var->data.mode != nir_var_shader_out ||
++                var->data.location < VARYING_SLOT_VAR0 ||
++                var->data.location > VARYING_SLOT_VAR31 ||
++                var->data.explicit_xfb_buffer || var->data.always_active_io ||
++                !glsl_type_is_vector_or_scalar(var->type) ||
++                glsl_get_bit_size(var->type) != 32)
++               continue;
++
++            const unsigned num_comps = glsl_get_vector_elements(var->type);
++            const nir_component_mask_t read =
++               (reads[var->data.location] >> var->data.location_frac) & BITFIELD_MASK(num_comps);
++            const nir_component_mask_t write_mask = nir_intrinsic_write_mask(intr);
++            const nir_component_mask_t kept = write_mask & read;
++            if (kept == write_mask)
++               continue;
++
++            if (kept == 0)
++               nir_instr_remove(instr);
++            else
++               nir_intrinsic_set_write_mask(intr, kept);
++
++            impl_progress = true;
++         }
++      }
++
++      if (impl_progress) {
++         nir_progress(true, impl, nir_metadata_control_flow);
++         progress = true;
++      }
++   }
++
++   return progress;
++}
++
++static void
++nvk_link_shader_varyings(uint32_t shader_count, struct vk_shader_compile_info *infos,
++                         const struct vk_graphics_pipeline_state *state)
++{
++   /* NFSMW: no fragment shader reads anything: every generic output of the
++    * vertex shader goes (position, clip/cull distances, point size, layer and
++    * viewport are not generic and stay). The vertex shader is compiled alone
++    * here, without the link flag.
++    */
++   if (shader_count == 1 && infos[0].stage == MESA_SHADER_VERTEX &&
++       infos[0].nir->xfb_info == NULL && nvk_vs_only_pipeline(state)) {
++      const uint8_t reads[VARYING_SLOT_MAX] = { 0 };
++      nir_shader *nir = infos[0].nir;
++      if (nvk_drop_unread_outputs(nir, reads)) {
++         NIR_PASS(_, nir, nir_opt_dce);
++         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++      }
++      return;
++   }
++
++   if (shader_count < 2 || !nvk_link_varyings_enabled())
++      return;
++
++   int fs = -1, producer = -1;
++   for (uint32_t i = 0; i < shader_count; i++) {
++      if (!(infos[i].flags & VK_SHADER_CREATE_LINK_STAGE_BIT_EXT))
++         continue;
++
++      switch (infos[i].stage) {
++      case MESA_SHADER_FRAGMENT:
++         fs = i;
++         break;
++      case MESA_SHADER_VERTEX:
++      case MESA_SHADER_TESS_EVAL:
++      case MESA_SHADER_GEOMETRY:
++         /* The last one before the fragment stage is the one that feeds it. */
++         if (producer < 0 || infos[i].stage > infos[producer].stage)
++            producer = i;
++         break;
++      default:
++         break;
++      }
++   }
++
++   if (fs < 0 || producer < 0 || infos[producer].nir->xfb_info != NULL)
++      return;
++
++   nir_shader *consumer = infos[fs].nir;
++
++   /* Colour writes to attachments that do not exist go first (see nvk_quitar_color_muerto), so the
++    * inputs only they used count as unread.
++    */
++   nvk_quitar_color_muerto(consumer, nvk_color_rt_mask(state));
++
++   uint8_t reads[VARYING_SLOT_MAX] = { 0 };
++   nvk_gather_fs_input_reads(consumer, reads);
++
++   nir_shader *nir = infos[producer].nir;
++   if (nvk_drop_unread_outputs(nir, reads)) {
++      NIR_PASS(_, nir, nir_opt_dce);
++      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++   }
++}
++
+ static VkResult
+ nvk_compile_shaders(struct vk_device *vk_dev,
+                     uint32_t shader_count,
+@@ -1278,6 +1632,8 @@ nvk_compile_shaders(struct vk_device *vk_dev,
+ {
+    struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
+ 
++   nvk_link_shader_varyings(shader_count, infos, state);
++
+    for (uint32_t i = 0; i < shader_count; i++) {
+       VkResult result = nvk_compile_shader(dev, &infos[i], state,
+                                            pAllocator, &shaders_out[i]);
+@@ -1630,6 +1986,11 @@ const struct vk_device_shader_ops nvk_device_shader_ops = {
     .hash_state = nvk_hash_state,
     .compile = nvk_compile_shaders,
     .deserialize = nvk_deserialize_shader,
@@ -2761,7 +3419,7 @@ index 1ae52b9..e4abae6 100644
     .cmd_bind_shaders = nvk_cmd_bind_shaders,
  };
 diff --git a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
-index e4b63a0..aae2b4f 100644
+index e4b63a0c..aae2b4f2 100644
 --- a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
 +++ b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
 @@ -31,6 +31,10 @@ struct nvkmd_switch_ctx {
@@ -2843,7 +3501,7 @@ index e4b63a0..aae2b4f 100644
  
     *ctx_out = &ctx->base;
 diff --git a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c
-index 63ea5fd..65dc00b 100644
+index 63ea5fdd..65dc00ba 100644
 --- a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c
 +++ b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c
 @@ -459,11 +459,42 @@ nvkmd_switch_try_create_pdev(struct vk_object_base *log_obj,
@@ -2892,7 +3550,7 @@ index 63ea5fd..65dc00b 100644
        .has_dma_buf = false,
        /* nvMapCreate accepts a caller-supplied page-aligned pointer. */
 diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
-index 00523fb..477421c 100644
+index 00523fb4..477421ca 100644
 --- a/src/vulkan/runtime/vk_pipeline.c
 +++ b/src/vulkan/runtime/vk_pipeline.c
 @@ -1145,6 +1145,53 @@ struct vk_graphics_pipeline {
@@ -2962,7 +3620,7 @@ index 00523fb..477421c 100644
        for (uint32_t i = 0; i < gfx_pipeline->stage_count; i++) {
           struct vk_shader *shader = gfx_pipeline->stages[i].shader;
 diff --git a/src/vulkan/runtime/vk_pipeline.h b/src/vulkan/runtime/vk_pipeline.h
-index 3c7cafd..cac1059 100644
+index 3c7cafd7..cac10592 100644
 --- a/src/vulkan/runtime/vk_pipeline.h
 +++ b/src/vulkan/runtime/vk_pipeline.h
 @@ -198,6 +198,17 @@ struct vk_pipeline_ops {

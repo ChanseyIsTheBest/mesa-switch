@@ -120,6 +120,11 @@ if [[ -f "${BUILD_DIR}/meson-private/coredata.dat" ]]; then
     setup_mode+=(--wipe)
 fi
 
+# MESA_SWITCH_INCREMENTAL=1 keeps an existing build directory and only rebuilds what changed
+# (source edits need no reconfigure; ninja reruns meson itself when a meson.build changes).
+if [[ "${MESA_SWITCH_INCREMENTAL:-0}" == 1 && -f "${BUILD_DIR}/build.ninja" ]]; then
+    echo "Incremental build in ${BUILD_DIR} (MESA_SWITCH_INCREMENTAL=1)"
+else
 "${MESON_BIN}" setup "${BUILD_DIR}" "${setup_mode[@]}" \
     --cross-file "${CROSS_FILE}" \
     --native-file "${NATIVE_FILE}" \
@@ -153,8 +158,15 @@ fi
     -Dcpp_rtti=false \
     -Dbuild-tests=false \
     -Dnvk-build-id="$(git rev-parse HEAD)"
+fi
 
-"${NINJA_BIN}" -C "${BUILD_DIR}"
+# The bindgen steps for the several nvidia/hwref/*/dev_mmu.h headers all write the depfile
+# src/nouveau/headers/dev_mmu.h.d; on Windows two of them running at once can fail with
+# "Permission denied". A second ninja run finishes whatever the first one left.
+if ! "${NINJA_BIN}" -C "${BUILD_DIR}"; then
+    echo "ninja failed; retrying once (parallel bindgen steps can collide on Windows)" >&2
+    "${NINJA_BIN}" -C "${BUILD_DIR}"
+fi
 
 case "${DESTDIR}" in
     "${ROOT_DIR}"/mesa-unified-install*) ;;

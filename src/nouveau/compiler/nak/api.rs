@@ -28,6 +28,8 @@ enum DebugFlags {
     Annotate,
     NoUgpr,
     Cycles,
+    NoReuse,
+    ReuseBasic,
 }
 
 pub struct Debug {
@@ -54,6 +56,10 @@ impl Debug {
                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
+                "noreuse" => flags |= 1 << DebugFlags::NoReuse as u8,
+                "reusebasic" => flags |= 1 << DebugFlags::ReuseBasic as u8,
+                // Operand reuse used to be opt-in; it is the default now.
+                "reuse" => (),
                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
             }
         }
@@ -90,6 +96,21 @@ pub trait GetDebugFlags {
 
     fn cycles(&self) -> bool {
         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
+    }
+
+    /// Maxwell operand-reuse flags (see assign_reuse_flags_sm50). On by default
+    /// since it was validated on hardware; NAK_DEBUG=noreuse turns it off. Being
+    /// a NAK_DEBUG flag, that is part of the value NVK hashes into its shader
+    /// cache keys, so binaries built with and without reuse never mix.
+    fn reuse(&self) -> bool {
+        self.debug_flags() & (1 << DebugFlags::NoReuse as u8) == 0
+    }
+
+    /// NAK_DEBUG=reusebasic limits operand reuse to FADD/FMUL/FFMA, the set that
+    /// was validated on hardware first; by default FMNMX, FSET, FSETP and SEL
+    /// take part as well.
+    fn reuse_basic(&self) -> bool {
+        self.debug_flags() & (1 << DebugFlags::ReuseBasic as u8) != 0
     }
 }
 
@@ -221,6 +242,14 @@ pub extern "C" fn nak_compiler_destroy(nak: *mut nak_compiler) {
 #[no_mangle]
 pub extern "C" fn nak_debug_flags(_nak: *const nak_compiler) -> u64 {
     DEBUG.debug_flags().into()
+}
+
+/// NFSMW/UnleashedRecomp: the scheduler latencies (NAK_TEX_LATENCY, NAK_MEM_LATENCY,
+/// NAK_ATTR_LATENCY), 10 bits each, for NVK's shader cache keys.
+#[no_mangle]
+pub extern "C" fn nak_sched_latency_key() -> u32 {
+    let latencies = crate::opt_instr_sched_common::sched_latencies();
+    latencies.tex | (latencies.mem << 10) | (latencies.attr << 20)
 }
 
 #[no_mangle]

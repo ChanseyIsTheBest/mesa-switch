@@ -144,16 +144,96 @@ UnleashedRecomp writes stderr to `sdmc:/switch/UnleashedRecomp/stderr.log`. Look
   ZCULL geometry and the channel has its ZCULL context.
 - `[nvk] ZCULL: plano de N bytes para profundidad WxH`: a depth image got a ZCULL plane (first 8 sizes).
   `[nvk] ZCULL: SIN plano ...` says why one did not (usually `TRANSFER_DST`).
-- `NVK fast paths: requested (set 4 contract found, draw contract found)`: UnleashedRecomp found the driver's shared
-  structures. A line about a self-check difference means a driver path turned itself off for the session.
+- `NVK fast paths: ... (set 4 contract found, draw contract found)`: UnleashedRecomp found the driver's shared
+  structures (`requested` when it asks for the paths, `off` otherwise). A line about a self-check difference means
+  a driver path turned itself off for the session.
+- The draw-path improvements (`nvk_switch_dibujo`) and set 4 by differences (`nvk_switch_set4`) run only for an
+  application that asks for them (`pedido > 0`; nfsmw-nx writes 1 on every submit). An application that says
+  nothing (`pedido = -1`) gets the usual paths, like any other Vulkan driver.
 
 Run-time variables read by the driver: `NVK_SWITCH_DIBUJO`, `NVK_SWITCH_DYN_UBO_DELTA`, `NVK_COPY_ENGINE`,
 `NVK_SWITCH_NO_UBO_CBUF`, `NVK_SUBTILING_KNOB`, `NVK_SHADER_STATS` (shader statistics; check that local memory
-stays at 0 with the branch flattening), `NVK_SWITCH_CMD_MEM_CPU_UNCACHED`, `NVK_SWITCH_CPU_WRITE_MEM_UNCACHED`,
-`NVK_SWITCH_MEM_STREAM_CPU_UNCACHED`.
+stays at 0 with the branch flattening), `NVK_ZCULL` (see below), `NVK_LINK_VARYINGS`,
+`NVK_SWITCH_VS_ONLY_VARYINGS` (see below), `NVK_SWITCH_CMD_MEM_CPU_UNCACHED`, `NVK_SWITCH_CPU_WRITE_MEM_UNCACHED`,
+`NVK_SWITCH_MEM_STREAM_CPU_UNCACHED`, `NAK_DEBUG` (e.g. `noreuse`, `reusebasic`) and `NAK_TEX_LATENCY`,
+`NAK_MEM_LATENCY`, `NAK_ATTR_LATENCY` (see below).
 
 ## Updating to a newer mesa-switch later
 
 In a git checkout of the newer mesa-switch: `git apply --3way nfsmw/mesa-switch-nfsmw-26.2.2.patch` (with the old
 tree's blobs available, for example after fetching this commit), or merge a branch holding this tree. Resolve
 conflicts the same way as above, and raise the NAK revision in `nvk_shader.c` whenever a NAK change is added.
+
+## Maxwell operand reuse (NAK), on by default
+
+NAK sets Maxwell's operand-reuse control bits between neighbouring FADD/FMUL/FFMA instructions that
+read the same register in the same operand slot, so the second one takes it from the operand
+collector's reuse cache instead of the register file (fewer register-bank conflicts; NVIDIA's
+compiler does this everywhere, NAK never did). The rules are conservative (same basic block,
+unpredicated, register not written by the first instruction, no scoreboard wait on the second) and
+the computation is unchanged. It was opt-in (`NAK_DEBUG=reuse`) until UnleashedRecomp ran with it on
+the console (GPU frame 22.63 -> 22.49 ms at its benchmark spot, image unchanged); now it is the
+default and `NAK_DEBUG=noreuse` turns it off (`reuse` is still accepted and does nothing). The NAK
+revision in `nvk_physical_device_compiler_flags` went to 2 with it, so no binary compiled without
+reuse is taken from a cache as if it had it.
+
+## ZCULL direction (`NVK_ZCULL`)
+
+`less` (default) programs `ZDIR_LESS` for every depth target, as NVIDIA's driver does; `greater`
+programs `ZDIR_GREATER` for every depth target (for reverse-Z applications, whose `GREATER` depth tests
+may get no hierarchical culling with `ZDIR_LESS`); `off` never enables ZCULL. Every mode keeps one
+direction for the whole run, so data saved with `STORE_ZCULL` is always loaded with the direction it was
+written with. The first render pass logs `[nvk] ZCULL mode: ...`. An experiment switch: if `greater`
+helps a reverse-Z main pass, a direction chosen per depth target is the next step.
+
+## Shader statistics format
+
+`NVK_SHADER_STATS=1` lines: `estadisticas de shader: <stage> spirv <first 4 bytes of the SPIR-V's BLAKE3>,
+<registers> registros, <local memory> B de memoria local, <warps> warps por SM, <size> B de codigo,
+<instructions> instrucciones, <static cycles> ciclos estaticos, <spills>/<fills> spills/fills a memoria`.
+The BLAKE3 matches `MESA_SPIRV_DUMP_PATH` file names and UnleashedRecomp's draw profiler.
+
+## Build script notes
+
+- `build-unified.sh` runs ninja a second time when the first run fails: on Windows the bindgen steps for the
+  several `nvidia/hwref/*/dev_mmu.h` headers share one depfile name and can collide ("Permission denied").
+- `MESA_SWITCH_INCREMENTAL=1` keeps `builddir-unified` and only rebuilds what changed, instead of
+  `meson setup --wipe`.
+
+## Unread varyings dropped from linked pipelines (`NVK_LINK_VARYINGS`, on by default)
+
+NVK compiled every stage of a pipeline on its own, although the pipeline runtime hands it all stages of a
+monolithic pipeline at once (`VK_SHADER_CREATE_LINK_STAGE_BIT_EXT`, both shaders keyed on both). Now
+`nvk_compile_shaders` first looks at which components of its generic inputs the fragment shader actually reads
+(through direct whole-variable loads; any other access keeps the whole input), after removing colour writes to
+attachments that do not exist, and drops the other components from the stores of the last pre-rasterization
+stage. The math and the vertex fetches that only fed them are removed by the usual dead-code elimination, and
+each vertex writes fewer attributes (NAK sets the output map per component). The fragment shader reads exactly
+what it read before, so the image cannot change. Only 32-bit vector/scalar generic varyings are touched, and
+nothing is done with transform feedback. `NVK_LINK_VARYINGS=0` turns it off; the setting is part of the
+pipeline cache UUID, and the NAK revision went to 3 with it.
+
+## Removed: small-target compression, vertex-attribute trimming, early depth test for discarding shaders
+
+`NVK_SWITCH_COMPRESS_MIN_KB` (compression from a lower image size), `NVK_SWITCH_VI_READ_ONLY` (unread vertex
+attributes not fetched) and `NVK_SWITCH_EARLY_Z_KILL` (depth test before discarding shaders that write no depth)
+made no measurable difference in UnleashedRecomp's GPU-bound tests, so they were taken out again: nothing else
+runs a path that only one game measured. Images are compressed from 1 MiB again.
+
+## NAK revision 4: operand reuse on more instructions, scheduler latency knobs
+
+- Operand reuse (above) is also set on FMNMX, FSET, FSETP and SEL (their two register sources sit in the same
+  operand slots as FADD's). `NAK_DEBUG=reusebasic` limits it to FADD/FMUL/FFMA again.
+- The instruction scheduler assumes 200 cycles for texture fetches, memory loads/stores and attribute loads/
+  interpolation. `NAK_TEX_LATENCY`, `NAK_MEM_LATENCY` and `NAK_ATTR_LATENCY` (1 to 1000) change those numbers, to
+  find the best ones on the console. Only the order of instructions changes, never what they compute. The three
+  values are folded into the compiler flags (bits 33-47), so every setting gets its own cache entries.
+- The NAK revision in `nvk_physical_device_compiler_flags` went to 4: all shaders are compiled again once.
+
+## Pipelines without a fragment shader (`NVK_SWITCH_VS_ONLY_VARYINGS`, on by default)
+
+`NVK_LINK_VARYINGS` also covers monolithic pipelines that have only a vertex shader (depth-only passes): no
+generic output is read, so they are all dropped (position, clip/cull distances, point size, layer and viewport
+are not generic and stay). A pre-rasterization library without the fragment shader state is left alone, since its
+fragment shader comes later. The case is part of the shader key (`nvk_hash_state`), so it never shares cache
+entries with the same vertex shader compiled for a pipeline that has a fragment shader.
